@@ -60,28 +60,51 @@ curl -s https://ipinfo.io/json          # ipinfo — тоже многие св�
 curl -s 'http://ip-api.com/json/?fields=country,city,org,as,query'
 ```
 и через браузер с сервера/по IP: MaxMind demo (maxmind.com/geoip/geoip2/geolocate —
-MaxMind используется AWS CloudFront, куда стоит Polymarket), ipwho.is (флаги
+MaxMind используется Cloudflare, за которым сейчас стоят API Polymarket — проверено:
+clob → 104.18.34.205, gamma → 172.64.153.51, оба AS13335 Cloudflare), ipwho.is (флаги
 datacenter/proxy — биржи на «облачные» подсети изучают придирчиво).
 Кто владеет блоком IP: `whois <IP> | egrep -i 'org|country'` или RIPE Stat
 (stat.ripe.net, виджет GeoIP WHOIS). Провайдер «страну» не скроет: блок AMZN-02 в IE
 так и пропишется.
 
-**Слой 3 — где физически стоит сервис (эмпирика, а не маркетинг):**
+**Слой 3 — «промерять путь до origin» — НЕ работает, и вот почему (важная поправка
+от 2026-09-03, получена эмпирически с живого дублинского инстанса):**
 ```bash
-# задержка TCP-хэндшейка до API Polymarket — с кандидата-регионов по 10 замеров:
 for i in 1 2 3 4 5; do curl -o /dev/null -s -w '%{time_connect}\n' https://clob.polymarket.com; done
-# и трассировка: mtr -rwzbc 30 clob.polymarket.com   (или traceroute)
+mtr -rwzbc 30 clob.polymarket.com
 ```
-Минимальный RTT ≈ там и origin; это независимо подтверждает «Лондон» из доки.
-Нюанс: `dig +short clob.polymarket.com` покажет CNAME на cloudfront.net — anycast-
-пункты CloudFront не равны origin'у, поэтому пинговать CloudFront бессмысленно,
-меряем полный запрос к API.
+Результат с сервера в eu-west-1: time_connect 2–3 мс, mtr обрывается на 4–5 хопе
+AS13335 (Cloudflare). Что это значит:
+- API биржи смотрит в ближайший anycast-узел Cloudflare, а не прямо в origin.
+  Значит `time_connect` = расстояние до края CDN, а не до дата-центра Polymarket.
+  2–3 мс из Дублина и ~1–10 мс из Вирджинии выглядят одинаково — латентностью
+  регион не определяется. Трассировка за Cloudflare не идёт (их магистраль приватна).
+- «Лондон (eu-west-2)» как расположение origin принимаем из официальной доки —
+  извне это не проверяется. Для нас и не нужно: близкий край CDN = хорошая связь.
+- Полезный смысл у теста остаётся один: время соединения с краем Cloudflare и потерь
+  нет → до сервера «достучаться» можно. Джиттер на 1–3 хопах (worst 80 мс у AWS-роутеров)
+  — это шейпинг ICMP-ответов, его игнорируем, верим только `time_connect`.
+
+**Слой 0 (главный, не серверный, а «удостоверяющий») — где реально стоит ТВОЙ сервер:
+ответ даёт сам AWS, а не маркетинг провайдера и не гео-базы:**
+```bash
+curl -s http://169.254.169.254/latest/dynamic/instance-identity/document
+# ждём JSON: "region": "eu-west-1", "availabilityZone": "eu-west-1?", "instanceId": "i-..."
+# если curl вернет ошибку (включён IMDSv2):
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document
+```
+Побочные приметы «это AWS, а не что-то ещё» (из того же замера): имя хоста
+`ip-172-31-*`, хопы 1–2 из неаллоцированного пространства (242.17.128/19, 240.5/16 —
+AWS так размечает внутреннюю пиринговую сеть; RDAP на них вообще не отвечает), хоп 3
+151.148.15.225 — блок 151.148/16 зарегистрирован на Amazon (ARIN, «AWS RPKI
+Management»). Всё вместе = типичный путь EC2; но регион подтверждает только JSON выше.
 
 ## 4. Правильный порядок действий при заказе сервера (дешёвая страховка)
 
 1. Запусти самый маленький инстанс в регионе на 15 минут (~$0.005–0.01).
 2. `curl geoblock` → ждём `blocked: false, country: IE`.
-3. Прогони тесты задержки до clob/gamma.
+3. Прогони `time_connect` до clob/gamma — это проверка «сеть живая», НЕ проверка региона.
 4. Только после этого переноси конфигурацию/аккаунт бота; если geoblock «видит» не IE —
    не борись: смени AZ/подсеть (перезапусти инстанс — AWS выдаст другой IP из пула) или
    регион (Амстердам у GCP как резервный вариант «API не ограничен»).
