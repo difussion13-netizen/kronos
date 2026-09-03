@@ -1,0 +1,42 @@
+# kronolog — конфигурация логгера
+
+outdir: /var/lib/kronolog          # локальный буфер (.jsonl.gz до выгрузки)
+rotate_min: 15                     # период ротации
+rotate_max_mb: 256                 # и/или предел размера части
+retain_days: 3                     # сколько хранить локально, если S3-выгрузка падает
+status_file: /var/lib/kronolog/status.json
+
+s3:
+  bucket: ""                       # <-- вписать свой, напр. kronolog-data-<user> (тот же регион!)
+  prefix: kronolog
+  region: us-east-1
+  delete_after_upload: true
+
+streams:
+  rtds:                            # Polymarket RTDS: цепные цены (источник резолва)
+    enabled: true
+    url: wss://ws-live-data.polymarket.com
+    chainlink_symbols: [btc/usd, eth/usd, sol/usd, xrp/usd]   # «фильтр — JSON-строка» уже в коде
+    binance_symbols: [btcusdt, ethusdt, solusdt, xrpusdt]     # второй источник для лаг-анализа
+
+  clob:                            # CLOB market channel: book/price_change/last_trade
+    enabled: true
+    url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    gamma: https://gamma-api.polymarket.com
+    assets: [btc, eth, sol, xrp]
+    intervals:
+      - {code: 5m,  seconds: 300}
+      - {code: 15m, seconds: 900}
+      - {code: 4h,  seconds: 14400}
+    lookahead_s: 900               # подписываться и на окна, открывающиеся в ближайшие 15 мин
+    discover_every_s: 45           # период пересчёта активных окон через Gamma
+    subscribe_template:            # если Polymarket поменяет схему — правим здесь, без кода
+      auth: {}
+      type: MARKET
+      assets_ids: []
+
+  binance:                         # микроструктура спота (для depth-фич; klines/трейды
+    enabled: true                  # истории всё равно берём из data.binance.vision)
+    url: wss://stream.binance.com:9443/stream
+    symbols: [btcusdt]             # добавить ethusdt/solusdt при желании (~+60% объёма)
+    kinds: [aggTrade, kline_1m, depth5@100ms]
