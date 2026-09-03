@@ -53,7 +53,7 @@ aws iam add-role-to-instance-profile --instance-profile-name kronolog \
   --role-name kronolog
 
 # 3) SG без входящих портов (доступ через SSM)
-aws ec2 create-security-group -g-name kronolog --description none
+aws ec2 create-security-group --group-name kronolog --description "no ingress"
 
 # 4) инстанс: t3.small on-demand, 16GB gp3 (Amazon Linux 2023 — SSM-параметр всегда актуален)
 aws ec2 run-instances \

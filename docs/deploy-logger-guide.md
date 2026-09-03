@@ -97,7 +97,9 @@ aws iam add-role-to-instance-profile --instance-profile-name kronolog --role-nam
 через тот же SSM, безопаснее), поэтому создаём пустую «сетевую группу безопасности»:
 
 ```bash
-SGID=$(aws ec2 create-security-group -g-name kronolog -d "no ingress" \
+# важно: свежий AWS CLI не принимает старые короткие флаги (-g-name, -d) —
+# только полные имена с двумя минусами, как ниже
+SGID=$(aws ec2 create-security-group --group-name kronolog --description "no ingress" \
   --query GroupId --output text)
 aws ec2 enable-ebs-encryption-by-default
 aws ec2 run-instances \
