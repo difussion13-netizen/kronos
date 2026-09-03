@@ -9,7 +9,7 @@ status_file: /var/lib/kronolog/status.json
 s3:
   bucket: ""                       # <-- вписать свой, напр. kronolog-data-<user> (тот же регион!)
   prefix: kronolog
-  region: us-east-1
+  region: eu-west-1
   delete_after_upload: true
 
 streams:

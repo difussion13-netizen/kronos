@@ -15,25 +15,28 @@
 
 ## Деплой на AWS (минимальная конфигурация)
 
-**Регион: `us-east-1`, не Ирландия.** Пояснение: origin Polymarket (Gamma/CLOB/RTDS)
-живёт в US East (за CloudFront ничего не меняет — WS-сессия держится до origin,
-из Дублина туда ~70–90 мс туда-обратно). Для *записи* регион безразличен, но:
-1) timestamp-скew книг/тиков будет консистентен с будущим live-боксом, который
-   обязан жить у origin; 2) выгрузка датасета на GPU-машину для бэктестов внутри
-   региона бесплатна (межрегионный egress $0.09/GB); 3) us-east-1 — самые дешёвые
-   инстансы вообще. Вариант eu-west-1 (Ирландия) допустим, если принципиальна
-   юрисдикция хранилища — тогда учитывайте будущий межрегионный трансфер датасета.
+**Регион: `eu-west-1` (Ирландия).** (Поправка 2026-09-03: раньше тут рекомендовался
+us-east-1 по неверному предположению, будто origin Polymarket в Вирджинии; по официальной
+доке он в **eu-west-2 (Лондон)**, а США/UK — close-only для открытия ордеров; ближайший
+разрешённый регион — eu-west-1, ~1–3 мс до origin. См. `docs/research-server-location.md`.)
+Для *записи* логов регион безразличен (публичное чтение не блокируется), но всё — EC2,
+S3, будущий GPU и торговый бокс — держим в одном регионе: intra-region трафик бесплатный,
+а торговый контур из US/EU-запрещённых зон открыть ордера не сможет.
 
 ### Ресурсы (всё, что нужно)
 
 ```bash
-export AWS_REGION=us-east-1
-BUCKET=kronolog-data-$(random_string)        # имя своё
+export AWS_REGION=eu-west-1
+BUCKET=kronolog-data-7f3k2p                      # имя своё (уникальное, строчные;
+#     НЕ оборачивайте в $( ) — в bash это «выполни программу», а не «впиши сюда»)
 
 # 1) бакет + life-cycle (gratuitно, Standard первые 90 дней — не трогаем)
-aws s3api create-bucket --bucket $BUCKET
+# Outside Virginia an explicit location is required, otherwise you'll get
+# IllegalLocationConstraintException:
+aws s3api create-bucket --bucket $BUCKET \
+  --create-bucket-configuration LocationConstraint=eu-west-1
 aws s3api put-public-access-block --bucket $BUCKET \
-  --public-access-block-configuration BlockAllAcls=true,RestrictPublicBuckets=true
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
 # 2) роль для инстанса (ключей на диске нет!)
 aws iam create-role --role-name kronolog --assume-role-policy-document '{

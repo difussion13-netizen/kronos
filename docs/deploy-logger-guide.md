@@ -49,17 +49,26 @@ S3 — это «безлимитный сетевой диск» Amazon, с не
 выключен. Имя бакета (так называется «папка верхнего уровня») должно быть уникальным для
 всего мира — придумайте свой суффикс из цифр.
 
-Вставьте построчно (поменяйте 1234 на случайные 4 цифры — это единственная правка):
+Вставьте блок целиком (поменяйте 1234 на любые 4–6 цифр/букв — имя бакета уникально
+на весь мир; вписывайте их **просто текстом**, без скобок `$( )` — в bash скобки со
+знаком доллара означают «выполни программу», а не «подставь сюда»):
 
 ```bash
 BUCKET=kronolog-1234
-aws s3api create-bucket --bucket $BUCKET
+# вне Вирджинии AWS требует явно указать регион бакета, иначе ошибка
+# IllegalLocationConstraintException:
+aws s3api create-bucket --bucket $BUCKET \
+  --create-bucket-configuration LocationConstraint=eu-west-1
 aws s3api put-public-access-block --bucket $BUCKET \
-  --public-access-block-configuration BlockAllAcls=true,RestrictPublicBuckets=true
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+# проверка, что бакет встал куда надо (ждём "LocationConstraint": "eu-west-1"):
+aws s3api get-bucket-location --bucket $BUCKET
 ```
 
-«Что должно получиться»: второй блок — «запрет публичного доступа», чтобы ваши логи не
-увидел никто из интернета.
+«Что должно получиться»: первая команда — тишина или `{}` (это успех, «создал»),
+вторая — тишина (это успех), третья — `"LocationConstraint": "eu-west-1"`.
+Второй блок — «запрет публичного доступа», чтобы ваши логи не увидел никто из
+интернета.
 
 ## Шаг 4. Выдать серверу «пропуск» вместо паролей
 

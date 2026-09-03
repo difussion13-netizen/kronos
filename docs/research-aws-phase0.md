@@ -1,7 +1,12 @@
 # Фаза 0: ресурсы AWS для накопления истории и полноценной работы
 
 Дата: 2026-09-02. Продолжение: `research-kronos-polymarket.md`.
-Регион по умолчанию: **us-east-1 (N. Virginia)**. Цены on-demand, Linux, us-east-1 (осень 2025–2026, проверить в консоли).
+~~Регион по умолчанию: us-east-1 (N. Virginia)~~ **Поправка 2026-09-03: регион —
+`eu-west-1` (Ирландия)**; US/UK/DE/PL и др. — «close-only» для открытия ордеров
+(Polymarket «Geographic Restrictions»), origin биржи — лондонский eu-west-2; методика
+проверки и разбор — `docs/research-server-location.md`. Цены ниже приведены по us-east-1
+как базовые; в eu-west-1 умножайте на ~1.05–1.10. Цены on-demand, Linux (осень 2025–2026,
+проверить в консоли).
 
 ---
 
