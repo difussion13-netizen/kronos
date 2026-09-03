@@ -153,7 +153,9 @@ sudo systemctl restart kronolog
 # где сервер «на самом деле» по версии AWS (должно быть "region": "eu-west-1"):
 curl -s http://169.254.169.254/latest/dynamic/instance-identity/document
 
-# как этот сервер «видит» Polymarket — ждём: "blocked": false и "country": "IE":
+# как этот сервер «видит» Polymarket — ждём: "country": "IE".
+# ВАЖНО: "blocked": true при country=IE — это НОРМА: флаг про веб-сайт (с него люди
+# не могут делать ставки из Ирландии), а торговый API для IE открыт — см. geoblock-док.
 curl -s https://polymarket.com/api/geoblock
 
 # что программа жива (должно быть active (running)):
@@ -164,7 +166,7 @@ systemctl status kronolog | head -5
 cat /var/lib/kronolog/status.json
 
 # последние строки журнала ошибок:
-journalctl -u kronolog -n 20 --no-pager
+sudo journalctl -u kronolog -n 20 --no-pager   # обязательно sudo: ты в терминале не root
 
 # через 20–30 минут — проверить, что файлы доехали до хранилища (в CloudShell, не на сервере):
 aws s3 ls s3://kronolog-1234/kronolog/rtds/$(date -u +%Y%m%d)/
@@ -173,7 +175,8 @@ aws s3 ls s3://kronolog-1234/kronolog/rtds/$(date -u +%Y%m%d)/
 Нормальная картина: `status.json` обновляется каждые 15 секунд, ошибок нет, а вечером в
 бакете лежат файлы `*.jsonl.gz`. Обе первые проверки — про будущее: логгеру гео-статусы
 не мешают вообще (он только читает), но если когда-то сюда переедет торговый бот,
-`geoblock: blocked=false, country=IE` — его пропуск. Если country не IE — не чиним
+`geoblock: country=IE` — его пропуск (flag "blocked" при IE=true — норма, он про
+веб-сайт, а не про API). Если country не IE — не чиним
 «пингами», это свойство IP-пула: перезапуск инстанса часто меняет адрес, либо берём
 Elastic IP в этом же регионе и проверяем заново (подробности: `research-server-location.md`). Дальше программа работает сама: перезапустится после
 сбоев, догонит обрывы связи, переживёт перезагрузку сервера (автозапуск настроен).
