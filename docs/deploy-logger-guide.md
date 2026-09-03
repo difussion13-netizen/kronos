@@ -139,6 +139,9 @@ sudo git clone -b arena/01a063d9-kronos https://github.com/difussion13-netizen/k
 cd /tmp/kronos/logger && sudo bash install.sh
 
 # 7.3 — подсказываем программе, куда грузить логи (имя бакета с шага 3!)
+# ВНИМАНИЕ: замени kronolog-1234 на СВОЁ имя бакета (то, что реально создали на Шаге 3)
+# и сверь с ролью: aws iam get-role-policy --role-name kronolog --policy-name s3-write
+# (там в Resource должен быть тот же бакет; не совпало — пересоздай политику на Шаге 4)
 sudo sed -i 's|bucket: ""|bucket: "kronolog-1234"|' /opt/kronolog/app/config.yaml
 sudo systemctl restart kronolog
 ```
@@ -201,6 +204,6 @@ Elastic IP в этом же регионе и проверяем заново (�
 |---|---|
 | `git clone` просит пароль | репозиторий стал приватным → сделать Public (GitHub: Settings → Danger zone) или скачать ZIP и залить Upload file |
 | Session Manager не подключается | сервер ещё грузится (подождать), либо пропустили шаг 4 вторую команду (право SSM) |
-| upload fail в логах | в `config.yaml` имя бакета не то, или роль не прицепилась: `aws ec2 describe-instances --filters Name=instance-state-name,Values=running --query 'Reservations[].Instances[].[Tags[0].Value,IamInstanceProfile.Value]'` |
+| upload fail / AccessDenied ... s3:PutObject | имя бакета в конфиге, в политике роли и реально созданный — все три должны совпасть: `sudo grep bucket /opt/kronolog/app/config.yaml`; `aws s3 ls`; `aws iam get-role-policy --role-name kronolog --policy-name s3-write`. Данные при этом НЕ теряются: локальный буфер держит 3 дня, retry догрузит сам после починки | `aws ec2 describe-instances --filters Name=instance-state-name,Values=running --query 'Reservations[].Instances[].[Tags[0].Value,IamInstanceProfile.Value]'` |
 | `age_last_msg_s` у потока большой и растёт | связь с биржей упала (или биржа чинится) — программа сама переподключается; проверьте `journalctl`, и если час не помогло — перезапуск: `sudo systemctl restart kronolog` |
 | instance-профиль «in use» при повторном запуске шага 4 | вы уже создавали его ранее — пропустите две последние команды шага 4 |
