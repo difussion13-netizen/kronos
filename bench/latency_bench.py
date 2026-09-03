@@ -256,26 +256,39 @@ def ws_next_text(sock, deadline):
 
 
 def get_clob_tokens(timeout, insecure):
-    """Пару живых token_id для подписки CLOB (тот же путь, что у логгера через gamma)."""
-    r = measure_get("gamma-api.polymarket.com", 443,
-                     "/markets?limit=8&active=true&closed=false&order=volume24hr"
-                     "&ascending=false", timeout, insecure, body_limit=400_000)
+    """Живые token_id для подписки CLOB.
+
+    Надёжнее всего — сам CLOB: GET /sampling-markets (публичный, без параметров)
+    отдаёт {"data":[{"tokens":[{"token_id":...},...]}, ...]}. Gamma со
+    своими order=/filters капризничает, поэтому она — только запасной вариант."""
     ids = []
     try:
-        markets = json.loads(r["body"])
-        if isinstance(markets, dict):
-            markets = markets.get("data", [])
-        for m in markets:
-            raw = m.get("clobTokenIds")
-            try:
-                toks = json.loads(raw) if isinstance(raw, str) else (raw or [])
-            except Exception:
-                toks = []
-            ids.extend(str(t) for t in toks)
+        r = measure_get("clob.polymarket.com", 443, "/sampling-markets",
+                        timeout, insecure, body_limit=2_000_000)
+        doc = json.loads(r["body"])
+        for m in doc.get("data", []):
+            ids.extend(str(t.get("token_id")) for t in m.get("tokens", [])
+                       if t.get("token_id"))
             if len(ids) >= 32:
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [warn] clob /sampling-markets: {e}; пробую gamma", file=sys.stderr)
+    if not ids:
+        try:
+            r = measure_get("gamma-api.polymarket.com", 443,
+                            "/markets?limit=8&active=true&closed=false",
+                            timeout, insecure, body_limit=400_000)
+            markets = json.loads(r["body"])
+            if isinstance(markets, dict):
+                markets = markets.get("data", [])
+            for m in markets:
+                raw = m.get("clobTokenIds")
+                toks = json.loads(raw) if isinstance(raw, str) else (raw or [])
+                ids.extend(str(t) for t in toks)
+                if len(ids) >= 32:
+                    break
+        except Exception as e:
+            print(f"  [warn] и gamma не ответил: {e}", file=sys.stderr)
     return ids[:32]
 
 
@@ -288,6 +301,8 @@ def bench_ws_clob(timeout, insecure):
         print(f"  [warn] gamma для токенов не ответил: {e}", file=sys.stderr)
     sock, t, peer = ws_open(host, port, path, timeout, insecure)
     out = dict(t, peer=peer, tokens=len(tokens))
+    if not tokens:
+        out["note"] = "не удалось получить token_id (см. [warn] выше); замерено только рукопожатие"
     try:
         if tokens:
             t0 = now()
@@ -439,18 +454,24 @@ def main():
               f"region={geo.get('region')!r} blocked={geo.get('blocked')}  "
               f"(blocked=true при country=IE — норма, это про веб-фронтир, API открыт)")
     else:
-        print("geoblock: ответ не получен (смотри колонку errors)")
+        g = results.get("geoblock", {})
+        st = ",".join(str(x) for x in g.get("status", [])) or "нет ответа"
+        err = g.get("errors", [])
+        extra = f", ошибки: {err[0]}" if err else ""
+        print(f"geoblock: HTTP {st} — биржа не отдала гео-JSON{extra} "
+              f"(для страны можно сверить: curl -s https://polymarket.com/api/geoblock)")
     print()
-    hdr = f"{'TARGET':<14}{'n':>3}  {'tcp ms p50(min)':<16}{'tls':<8}{'ttfb ms p50':<14}{'TOTAL ms p50  mean±sd':<24}{'errs':<5}edge"
+    hdr = f"{'TARGET':<14}{'n':>3}  {'tcp ms p50(min)':<16}{'tls':<8}{'ttfb ms p50':<14}{'TOTAL ms p50  mean±sd':<24}{'st':<8}{'errs':<5}edge"
     print(hdr)
     print("-" * len(hdr))
     for name, t in results.items():
         if t["samples"]:
             tcp, tls, ttfb, tot = t["tcp"], t["tls"], t["ttfb"], t["total"]
+            st = ",".join(str(x) for x in t["status"])
             print(f"{name:<14}{tot['n']:>3}  {tcp['p50']:>7.1f}({tcp['min']:.1f}) "
                   f"{tls['p50']:>6.1f}  {ttfb['p50']:>9.1f}     "
                   f"{tot['p50']:>6.1f}  {tot['mean']:>6.1f}±{tot['stdev']:<5.1f}"
-                  f"{len(t['errors']):<5}{','.join(t['peers'])[:18]}")
+                  f"{st:<8}{len(t['errors']):<5}{','.join(t['peers'])[:18]}")
         else:
             print(f"{name:<14}  0  {'—':<16}{'—':<8}{'—':<14}{'—':<24}{len(t['errors']):<5}"
                   f"{(t['errors'][:1] or [''])[0][:40]}")
@@ -462,7 +483,8 @@ def main():
                 continue
             ff = w.get("first_frame_ms")
             extra = (f"first_frame {ff:.0f} ms" if ff is not None
-                     else f"first_frame нет ({w.get('note','')})")
+                     else ("first_frame нет: " + w.get("note", "тишина")) if w.get("note")
+                     else "first_frame нет")
             tk = f" tokens={w['tokens']}" if "tokens" in w else ""
             print(f"{label:<14} handshake {w['handshake_ms']:.1f} ms "
                   f"(tcp {w['tcp_ms']:.1f} + tls {w['tls_ms']:.1f} + up {w['up_ms']:.1f})  {extra}{tk}")
