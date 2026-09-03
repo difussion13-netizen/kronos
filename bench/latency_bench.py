@@ -67,6 +67,27 @@ def readn(sock, n, deadline):
     return buf
 
 
+def dechunk(data):
+    """Разобрать chunked-тело: 1A\\r\\n{байты}\\r\\n ... 0\\r\\n\\r\\n.
+    Cloudflare отдаёт большинство ответов без Content-Length — вот в таком виде."""
+    out = b""
+    i = 0
+    while True:
+        j = data.find(b"\r\n", i)
+        if j < 0:
+            break
+        try:
+            size = int(data[i:j].split(b";")[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        start = j + 2
+        out += data[start:start + size]
+        i = start + size + 2
+    return out
+
+
 def read_until_double_crlf(sock, deadline):
     """Читать до \\r\\n\\r\\n (HTTP-заголовки). Возвращает (headers_bytes, остаток)."""
     buf = b""
@@ -163,6 +184,8 @@ def measure_get(host, port, path, timeout, insecure, body_limit=4000):
             if total_in > max(64_000, body_limit * 40):
                 break  # защита; замеры идут на крошечных ответах
         total_ms = (now() - t0) * 1000.0
+        if b"chunked" in head.lower():
+            body = dechunk(body)
         return dict(status=status, dns_ms=dns_ms, tcp_ms=tcp_ms, tls_ms=tls_ms,
                     ttfb_ms=ttfb_ms, total_ms=total_ms, bytes=total_in,
                     peer=peer, body=body[:body_limit].decode("utf-8", "replace"))
