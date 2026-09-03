@@ -60,7 +60,7 @@ aws ec2 run-instances \
   --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --instance-type t3.small --security-group-ids sg-XXXXXXXX \
   --iam-instance-profile Name=kronolog \
-  --block-device-mappings DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3} \
+  --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=kronolog}]'
 
 # (Ubuntu 24.04 тоже подходит — install.sh сам определяет apt/dnf;

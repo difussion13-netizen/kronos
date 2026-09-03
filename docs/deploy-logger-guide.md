@@ -107,11 +107,14 @@ aws ec2 run-instances \
   --instance-type t3.small \
   --security-group-ids $SGID \
   --iam-instance-profile Name=kronolog \
-  --block-device-mappings DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3} \
+  --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=kronolog}]' \
   --query InstanceId --output text
 ```
 
+Кавычки вокруг `'DeviceName=...Ebs={...}'` — обязательны: без них bash сам
+«раскрывает» фигурные скобки и AWS получает изуродованную команду
+(ошибка ParamValidation: Invalid type ... BlockDeviceMappings).
 Последняя строчка выведет идентификатор вида `i-0abc123...` — **запишите его**, он понадобится.
 Ждём ~40 секунд сервер загружается. (Образ ОС — «Amazon Linux 2023», свежая версия
 подтянется автоматически, адрес образа — это «самый свежий, обнови».)
