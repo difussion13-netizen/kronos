@@ -48,6 +48,9 @@ aws iam put-role-policy --role-name kronolog --policy-name s3-write --policy-doc
  \"Resource\":\"arn:aws:s3:::$BUCKET/*\"},
  {\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],
  \"Resource\":\"arn:aws:s3:::$BUCKET\"}]}"
+# без этой политики Session Manager не пустит на сервер («Not connected»)
+aws iam attach-role-policy --role-name kronolog \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam create-instance-profile --instance-profile-name kronolog
 aws iam add-role-to-instance-profile --instance-profile-name kronolog \
   --role-name kronolog
