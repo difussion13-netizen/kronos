@@ -58,3 +58,27 @@ python3 /tmp/kreader.py verify --bucket $B --sym BTCUSDT
   чтение бакета ролью — проще разбить `--files`.
 - `verify` обращается к api.binance.com — из некоторых регионов AWS сети Binance
   фильтруются; это не дефект данных.
+
+## dataset.py + smoke.py — датасет и «палочка-выручалочка»
+
+Сборка таблицы «бары + фичи (только прошлое) + метки future» и честная
+walk-forward оценка логистической регрессией. Оба файла скачивать в одну папку
+(dataset импортирует kreader).
+
+```bash
+D=/tmp; for f in kreader dataset smoke; do curl -sL -o $D/$f.py \
+  https://raw.githubusercontent.com/difussion13-netizen/kronos/arena/01a063d9-kronos/analysis/$f.py; done
+python3 $D/dataset.py --bucket $B --days 20260903-20260909 --tf 300 \
+    --assets btc,eth,sol,xrp --outdir /tmp/ds
+python3 $D/smoke.py --dir /tmp/ds --asset btc --horizon 5
+```
+
+- `dataset` читает binance+rtds (не clob! он тяжёлый) → csv-таблицы + meta.json
+  (описание колонок) + npz если есть numpy. Выводит баланс классов: доля `flat`
+  при пороге 4.7 б.п. — это доля рынка, где «торговать нечего» в принципе.
+- `smoke`: train/holdout 70/30 по ВРЕМЕНИ; метрики acc/balanced/AUC/Brier/точность
+  топ-10% самых уверенных; два базлайна (моментум, мажоритарный класс); вердикт.
+- Честные ориентиры: неделя данных → acc ≈ 50–51% — это НОРМА («сигнала нет»).
+  Устойчивые 52–55% на длинном периоде — повод строить нормальную модель.
+  >56% на неделе — сначала ищи утечку будущего в фичи, потом радуйся.
+- Прогон занятой: 7 суток ≈ 3–5 минут в CloudShell (clob не читается!).
