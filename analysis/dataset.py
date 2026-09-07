@@ -201,7 +201,7 @@ def build_table(a, asset, trades, cl):
         if ok_labels:
             rows.append(row)
     print(f"  [{asset}] тиков {len(trades)} (ts из приёма {fb}), 1м-баров {len(m1)}, "
-          f"{a.tf}-баров {len(bs)}, строк с метками {len(rows)}; CL-точек {len(cl)} {cl_info.get('source','')}")
+          f"{a.tf}-баров {len(bs)}, строк с метками {len(rows)}; CL-точек {len(cl)}")
     return rows
 
 
