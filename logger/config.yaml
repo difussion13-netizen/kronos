@@ -38,5 +38,5 @@ streams:
   binance:                         # микроструктура спота (для depth-фич; klines/трейды
     enabled: true                  # истории всё равно берём из data.binance.vision)
     url: wss://stream.binance.com:9443/stream
-    symbols: [btcusdt]             # добавить ethusdt/solusdt при желании (~+60% объёма)
+    symbols: [btcusdt, ethusdt, solusdt, xrpusdt]   # 4 актива под датасет (+~60% объёма binance)
     kinds: [aggTrade, kline_1m, depth5@100ms]
