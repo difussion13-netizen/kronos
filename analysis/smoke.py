@@ -124,6 +124,8 @@ def main():
     ap.add_argument("--min-rows", type=int, default=200)
     ap.add_argument("--drop", default="", help="исключить фичи (через запятую; префикс снимает семейство, напр. hour)")
     ap.add_argument("--boot", type=int, default=400, help="число бустрап-пересэмплов по дневным блокам (0=выкл)")
+    ap.add_argument("--wfa", action="store_true", help="walk-forward по дням: для каждого суток модели учатся только на данных до них")
+    ap.add_argument("--warmup-days", type=int, default=2, help="--wfa: сколько первых UTC-суток только на обучение")
     a = ap.parse_args()
     path = os.path.join(a.dir, f"{a.asset}_{a.tf}s.csv")
     if not os.path.exists(path):
@@ -174,6 +176,42 @@ def main():
         boot = (lo, hi, p_gt, len(day_rows))
         print(f"bootstrap по {len(day_rows)} дн. (блок = сутки UTC): acc p10 {lo:.3f}  "
               f"p50 {accs[len(accs)//2]:.3f}  p90 {hi:.3f}   P(acc>0.5) = {p_gt:.2f}")
+
+    if a.wfa:
+        import datetime as _dt
+        byday = {}
+        for i in range(len(X)):
+            d = _dt.datetime.utcfromtimestamp(t[i] / 1000.0 if t[i] > 1e12 else t[i]).date()
+            byday.setdefault(d, []).append(i)
+        days = sorted(byday)
+        print(f"\n#walk-forward по дням ({len(days)} суток, warmup {a.warmup_days}):")
+        accs = []
+        for di, d in enumerate(days):
+            if di < a.warmup_days:
+                print(f"  {d}: train-only (warmup) {len(byday[d])} строк")
+                continue
+            tr = [i for dd in days[:di] for i in byday[dd]]
+            te = byday[d]
+            mm, _ = train_logreg([X[i] for i in tr], [y[i] for i in tr])
+            if mm is None:
+                continue
+            pte = predict(mm, [X[i] for i in te])
+            aa = sum((1 if p >= 0.5 else 0) == y[i] for p, i in zip(pte, te)) / len(te)
+            pos = sum(y[i] for i in te) / len(te)
+            accs.append(aa)
+            print(f"  {d}: n={len(te):4d}  acc {aa:.3f}  (доля up {pos:.2f})")
+        if accs:
+            import math as _m
+            mean = sum(accs) / len(accs)
+            sd = _m.sqrt(sum((x - mean) ** 2 for x in accs) / max(1, len(accs) - 1))
+            gt = sum(1 for x in accs if x > 0.5)
+            print(f"итог: acc по дням mean {mean:.3f} ± {sd:.3f}  |  дней выше 0.5: {gt}/{len(accs)}")
+            if len(accs) >= 4 and mean - sd > 0.5:
+                print("вердикт wfa: перевес УСТОЙЧИВ по дням (mean-sd>0.5) — расширять окно, копить, искать утечки")
+            elif len(accs) >= 4 and mean <= 0.5:
+                print("вердикт wfa: по дням перевеса нет — недельный acc был флюком, закрываем горизонт")
+            else:
+                print("вердикт wfa: дней мало — не выдумывай, копи данные")
 
     gain = pm["acc"] - max(pa, 0.5)
     if boot and boot[0] > 0.5:
