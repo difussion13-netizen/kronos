@@ -333,6 +333,10 @@ class Stream:
                 if isinstance(msg, bytes):
                     msg = msg.decode("utf-8", "replace")
                 if msg == "PONG":
+                    # PONG — доказательство живого сокета: обновляем last,
+                    # иначе «полумертвое» соединение (PING буферизуется, ответов нет)
+                    # висело бы до idle_timeout без единого симптома.
+                    last = time.monotonic()
                     continue
                 STATS.touch(self.name)
                 self.writer.write_raw(msg)
@@ -359,8 +363,10 @@ class RtdsStream(Stream):
                 "topic": "crypto_prices", "type": "update",
                 "filters": ",".join(bn_syms),
             }]})
+        # 600 -> 90 c: RTDS шлёт PONG каждые 5 с и данные каждые ~10-20 с;
+        # тишина дольше минуты = полумертвый сокет, чиним reconnect'ом сразу.
         super().__init__(name, cfg, writer, c["url"],
-                         idle_timeout=600, ping_text_interval=5.0, ping_interval=None)
+                         idle_timeout=90.0, ping_text_interval=5.0, ping_interval=None)
         self._init_subs = subs
 
     async def on_connected(self, ws):
