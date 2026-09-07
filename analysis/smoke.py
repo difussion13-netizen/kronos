@@ -23,11 +23,12 @@ def is_label(c):
     return any(c.startswith(p) for p in LABEL_COLS) or c == "close"
 
 
-def load(path, horizon, binary=True):
+def load(path, horizon, binary=True, drop=()):
     with open(path, newline="") as f:
         rd = csv.DictReader(f)
         cols = rd.fieldnames
-        feats = [c for c in cols if not is_label(c) and c != "t0"]
+        feats = [c for c in cols if not is_label(c) and c != "t0"
+                 and not any(c == d or c.startswith(d + "_") for d in drop)]
         X, y, t = [], [], []
         for row in rd:
             try:
@@ -121,11 +122,16 @@ def main():
     ap.add_argument("--horizon", type=int, default=5, help="минуты")
     ap.add_argument("--holdout", type=float, default=0.3)
     ap.add_argument("--min-rows", type=int, default=200)
+    ap.add_argument("--drop", default="", help="исключить фичи (через запятую; префикс снимает семейство, напр. hour)")
+    ap.add_argument("--boot", type=int, default=400, help="число бустрап-пересэмплов по дневным блокам (0=выкл)")
     a = ap.parse_args()
     path = os.path.join(a.dir, f"{a.asset}_{a.tf}s.csv")
     if not os.path.exists(path):
         raise SystemExit(f"нет {path} — сначала dataset.py")
-    cols, feats, X, y, t = load(path, a.horizon)
+    drop = tuple(x.strip() for x in a.drop.split(",") if x.strip())
+    cols, feats, X, y, t = load(path, a.horizon, drop=drop)
+    if drop:
+        print(f"# drop: {list(drop)}")
     if len(X) < a.min_rows:
         raise SystemExit(f"строк с меткой маловато ({len(X)} < {a.min_rows}) — расширь --days "
                          f"или уменьши --min-rows (для проверки пайплайна)")
@@ -147,11 +153,40 @@ def main():
     maj = 1 if sum(ytr) / len(ytr) >= 0.5 else 0
     pa = sum(yy == maj for yy in yte) / len(yte)
     print(f"базлайн «всегда {maj}» (класс {sum(ytr)/len(ytr):.0%}): acc {pa:.3f}")
+    # ---- bootstrap по дневным блокам: честный разброс acc с учётом перекрытых меток
+    boot = None
+    if a.boot:
+        import random
+        days = {}
+        for i, ts in enumerate(tte):
+            days.setdefault(int(ts // 86400), []).append(i)
+        pred = [1 if p >= 0.5 else 0 for p in predict(m, Xte)]
+        ok = [int(pred[i] == yte[i]) for i in range(len(yte))]
+        day_rows = list(days.values())
+        rng = random.Random(7)
+        accs = []
+        for _ in range(a.boot):
+            sel = [i for _ in range(len(day_rows)) for i in rng.choice(day_rows)]
+            accs.append(sum(ok[i] for i in sel) / len(sel))
+        accs.sort()
+        lo = accs[int(0.10 * (len(accs) - 1))]; hi = accs[int(0.90 * (len(accs) - 1))]
+        p_gt = sum(1 for x in accs if x > 0.5) / len(accs)
+        boot = (lo, hi, p_gt, len(day_rows))
+        print(f"bootstrap по {len(day_rows)} дн. (блок = сутки UTC): acc p10 {lo:.3f}  "
+              f"p50 {accs[len(accs)//2]:.3f}  p90 {hi:.3f}   P(acc>0.5) = {p_gt:.2f}")
+
     gain = pm["acc"] - max(pa, 0.5)
-    verdict = ("сигнала нет (в пределах шума)" if gain < 0.015 else
-               "слабый намёк — проверь на других --horizon/--asset" if gain < 0.03 else
-               "есть перевес над базлайнами — но на недельных данных это почти наверняка "
-               "шум/утечка, перепроверяй на длинном периоде")
+    if boot and boot[0] > 0.5:
+        verdict = ("ПЕРЕВЕС ПЕРЕЖИВАЕТ bootstrap (p10>0.5) — это уже не монетка; "
+                   "беги ablation (--drop) и ищи утечки до любой радости")
+    elif gain < 0.015:
+        verdict = "сигнала нет (в пределах шума)"
+    elif gain < 0.03:
+        verdict = "слабый намёк — проверь на других --horizon/--asset"
+    else:
+        verdict = ("есть перевес над базлайнами — но нижняя граница bootstrap не "
+                   "отличима от 0.5, т.е. неделька может врать; копить данные и "
+                   "перепроверять, а не торговать")
     print(f"\nвердикт: {verdict}  (прирост acc над max(базлайнами) = {gain:+.3f})")
     print("помни: метки flat отброшены; AUC 0.5=монетка; top10% acc — как ведёт себя "
           "самая уверенная декада прогнозов (именно её торговали бы).")
