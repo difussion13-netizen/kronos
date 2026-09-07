@@ -59,3 +59,17 @@ clob_ws        handshake 7.9 ms (tcp 1.9 + tls 4.0 + up 2.0)  first_frame 41 ms 
 --tag ИМЯ       подпись локации в выводе
 --url name=host[:port]/path   своя мишень (для тестов/других сервисов)
 ```
+
+## audit_s3.py — сверка накопленных данных
+
+Раз в неделю (или когда что-то чинили) запускай из **CloudShell**:
+
+```bash
+curl -sL -o /tmp/audit.py https://raw.githubusercontent.com/difussion13-netizen/kronos/arena/01a063d9-kronos/bench/audit_s3.py
+python3 /tmp/audit.py --bucket ИМЯ-ТВОЕГО-БАКЕТА        # + --deep для 3 файлов на поток
+```
+
+Покажет: файлы по потокам/дням, пустые (у rtds — норма), «пробелы» в 15-минутной
+сетке (это провалы записи — их должно быть 0), реальный GB/день и прогноз хранения
+на 150 дней, и разбор содержимого свежего файла: типы событий (book/price_change/
+tick/chainlink), темп, битые строки. Ничего не меняет, только читает S3.
