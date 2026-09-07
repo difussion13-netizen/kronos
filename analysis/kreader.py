@@ -382,7 +382,7 @@ def bars_from_mid(series, tf=60):
         if cur is None:
             out[k] = v
     ks = sorted(out)
-    return [(k, out[k], out[k], out[k], 0) for k in ks]
+    return [(k, v, v, v, v, 0) for k, v in ((k, out[k]) for k in ks)]
 
 
 def cmd_candles(a):
