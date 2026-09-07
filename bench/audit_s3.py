@@ -127,6 +127,7 @@ def main():
     ap.add_argument("--prefix", default="kronolog")
     ap.add_argument("--rotate-min", type=int, default=15, help="период ротации (config.yaml)")
     ap.add_argument("--deep", action="store_true", help="по 3 файла на поток вместо 1")
+    ap.add_argument("--gaps", action="store_true", help="показать крупные окна тишины по потокам")
     args = ap.parse_args()
 
     files = s3_ls(args.bucket, args.prefix)
@@ -147,33 +148,56 @@ def main():
             except ValueError:
                 pass
         by_stream[stream].append({"key": key, "size": size, "mtime": mtime,
-                                  "start": start, "day": (m.group("day") if m else str(mtime.date()))})
+                                  "start": start, "day": (m.group("day") if m else mtime.strftime("%Y%m%d"))})
 
     now = datetime.now(timezone.utc)
     days = sorted({f["day"] for fs in by_stream.values() for f in fs})
     print(f"=== аудит kronolog: бакет {args.bucket} ===")
-    print(f"дней данных: {len(days)} ({days[0]}…{days[-1]})   ротация: каждые {args.rotate_min} мин\n")
+    print(f"дней данных (по именам файлов): {len(days)} ({days[0]}…{days[-1]})   "
+          f"ротация: каждые {args.rotate_min} мин\n")
 
     expect = args.rotate_min * 60
     total_bytes = sum(f["size"] for fs in by_stream.values() for f in fs)
-    header = f"{'поток':<10}{'файлов':>7}{'пустых':>7}{'размер':>10}{'пробелов>2.5x':>14}  последний файл"
+    header = (f"{'поток':<10}{'файлов':>7}{'пустых':>7}{'размер':>10}{'пробелов>2.5x':>14}"
+              f"{'покрытие':>10}  последний файл")
     print(header)
     print("-" * len(header))
+    stream_gaps = {}
+    elapsed_h = None
     for stream, fs in sorted(by_stream.items()):
         empty = sum(1 for f in fs if f["size"] < 60)
-        # пробелы в сетке: только по файлам со start, до "сейчас"
         starts = sorted(f["start"] for f in fs if f["start"])
-        holes = 0
+        holes, gaps = 0, []
         for a, b in zip(starts, starts[1:]):
-            if (b - a).total_seconds() > expect * 2.5:
+            d = (b - a).total_seconds()
+            if d > expect * 2.5:
                 holes += 1
-        # если сеть рвалась в начале или хвосте — не считаем: сравниваем с последним start vs now тоже мягко
+                gaps.append((d, a, b))
+        gaps.sort(reverse=True)
+        stream_gaps[stream] = gaps
+        if starts:
+            covered_h = len(starts) * expect / 3600.0
+            span_h = (starts[-1] - starts[0]).total_seconds() / 3600.0
+            elapsed_h = elapsed_h or span_h
+            cov = f"{covered_h:.0f}/{span_h:.0f}ч"
+        else:
+            cov = "?"
         last = max(starts) if starts else max(f["mtime"] for f in fs)
         print(f"{stream:<10}{len(fs):>7}{empty:>7}{fmt_bytes(sum(f['size'] for f in fs)):>10}"
-              f"{holes:>14}  {last:%m-%d %H:%M} UTC")
+              f"{holes:>14}{cov:>10}  {last:%m-%d %H:%M} UTC")
     print()
+    if args.gaps:
+        print("окна тишины (перерывы > 40 мин), топ-5 на поток:")
+        for stream, gaps in sorted(stream_gaps.items()):
+            top = [g for g in gaps if g[1] is not None][:5]
+            if not top:
+                print(f"  [{stream}] чисто")
+            for d, a, b in top:
+                print(f"  [{stream}] {d/3600:.1f} ч молчания: {a:%m-%d %H:%M} -> {b:%m-%d %H:%M} UTC")
+        print()
 
-    per_day = total_bytes / max(len(days), 1)
+    cover_days = max((elapsed_h or 24) / 24.0, 1.0)
+    per_day = total_bytes / cover_days
     print(f"всего: {fmt_bytes(total_bytes)}  ≈ {fmt_bytes(per_day)}/день  → "
           f"за 150 дней ≈ {per_day*150/1e9:.1f} GB, хранение ~${per_day*150/1e9*0.023:.0f}/мес S3 Standard")
     print()
