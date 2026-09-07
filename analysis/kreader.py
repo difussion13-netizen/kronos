@@ -27,6 +27,7 @@ import argparse
 import gzip
 import io
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -66,6 +67,13 @@ def files_of(a, stream, days):
     return out
 
 
+CACHE = (os.environ.get("KRONOS_CACHE") or "").strip() or None
+
+
+def _cached_dir(bucket, prefix, stream, day):
+    return CACHE and os.path.join(CACHE, bucket, prefix, stream, day)
+
+
 FKEY_RE = re.compile(r"^(?P<stream>[a-z_]+?)_(?P<day>\d{8})_(?P<time>\d{6})\.jsonl\.gz$")
 
 
@@ -80,7 +88,11 @@ def sh_bytes(cmd):
 
 def day_files(bucket, prefix, stream, day):
     """Файлы потока за день: [(имя, размер_байт)], отсортированные по времени части.
-    (aws s3 ls в строке отдаёт «дата время размер ключ» — берём размер и хвост ключа.)"""
+    Если задан кэш (KRONOS_CACHE) и день там есть — читаем список с диска."""
+    cd = _cached_dir(bucket, prefix, stream, day)
+    if cd and os.path.isdir(cd):
+        return sorted((f, os.path.getsize(os.path.join(cd, f)))
+                      for f in os.listdir(cd) if f.endswith(".jsonl.gz"))
     out = sh_bytes(f"aws s3 ls s3://{bucket}/{prefix}/{stream}/{day}/").decode()
     pairs = []
     for line in out.splitlines():
@@ -94,22 +106,33 @@ def day_files(bucket, prefix, stream, day):
 
 def iter_lines(bucket, prefix, stream, day, name, limit=None):
     """Строки одного .jsonl.gz, потоково (aws s3 cp -> stdout), без temp-файлов."""
-    p = subprocess.Popen(f"aws s3 cp s3://{bucket}/{prefix}/{stream}/{day}/{name} -",
-                         shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    cd = _cached_dir(bucket, prefix, stream, day)
+    local = cd and os.path.join(cd, name)
+    p = None
+    if local and os.path.exists(local):
+        fh = open(local, "rb")
+        gz_src = fh
+    else:
+        p = subprocess.Popen(f"aws s3 cp s3://{bucket}/{prefix}/{stream}/{day}/{name} -",
+                             shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        gz_src = io.BufferedReader(p.stdout, 1 << 20)
     n = 0
     try:
-        with gzip.GzipFile(fileobj=io.BufferedReader(p.stdout, 1 << 20)) as g:
+        with gzip.GzipFile(fileobj=gz_src) as g:
             for raw in io.TextIOWrapper(g, encoding="utf-8", errors="replace"):
                 yield raw
                 n += 1
                 if limit and n >= limit:
                     return
     finally:
-        p.stdout.close()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            p.kill()
+        if p is not None:
+            p.stdout.close()
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        elif gz_src.closed is False:
+            pass
 
 
 def parse_rec(line):

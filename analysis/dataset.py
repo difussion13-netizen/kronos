@@ -31,29 +31,69 @@ import kreader as K  # noqa: E402
 VERSION = "1.0"
 
 
-def load_trades(a, asset):
-    """[(ts_s, px, vol)] для символа — из binance-потока через загрузчик kreader."""
-    class A:  # маленький фасад под load_binance_series
-        pass
-    ka = A()
-    for k in ("bucket", "prefix", "files"):
-        setattr(ka, k, getattr(a, k))
-    ka.days = a.days_list
-    series, fb = K.load_binance_series(ka, a.days_list, asset)
-    return series, fb
-
-
-def load_cl(a, asset):
-    class A:
-        pass
-    ka = A()
-    for k in ("bucket", "prefix", "files"):
-        setattr(ka, k, getattr(a, k))
-    try:
-        series, info = K.load_chainlink(ka, a.days_list, asset + "/usd")
-    except SystemExit:
-        series, info = [], {"rows_scanned": 0}
-    return series, info
+def collect(a, assets):
+    """Один проход по binance/ и rtds/ за все дни -> {asset: [(ts,px,vol)]}, {asset: [(ts,px,recv)]}."""
+    tb = {x: [] for x in assets}
+    clp = {x: [] for x in assets}
+    base_of = {K.to_binance_sym(x): x for x in assets}            # btcusdt -> btc
+    cl_of = {(x.upper() + "/USD"): x for x in assets}             # BTC/USD  -> btc
+    scanned = {"binance": 0, "rtds": 0}
+    for day in a.days_list:
+        for name, _ in K.files_of(a, "binance", [day]):
+            for line in K.iter_lines(a.bucket, a.prefix, "binance", day, name):
+                scanned["binance"] += 1
+                t, raw = K.parse_rec(line)
+                if not isinstance(raw, dict) or "@" not in str(raw.get("stream", "")):
+                    continue
+                st = str(raw["stream"]).lower()
+                base, _, kind = st.partition("@")
+                asset = base_of.get(base)
+                if not asset or "aggtrade" not in kind:
+                    continue
+                d = raw.get("data") or {}
+                try:
+                    px = float(d["p"])
+                    ts = float(d.get("T") or d.get("E") or 0) / 1000.0 or (t or 0) / 1e9
+                    vol = float(d.get("q") or 0)
+                except Exception:
+                    continue
+                if ts > 1e9:
+                    tb[asset].append((ts, px, vol))
+        for name, _ in K.files_of(a, "rtds", [day]):
+            for line in K.iter_lines(a.bucket, a.prefix, "rtds", day, name):
+                scanned["rtds"] += 1
+                t, raw = K.parse_rec(line)
+                if not isinstance(raw, dict):
+                    continue
+                pay = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
+                if not isinstance(pay, dict):
+                    continue
+                asset = cl_of.get(str(pay.get("symbol", "")).upper())
+                if not asset:
+                    continue
+                recv = (t or 0) / 1e9
+                pts = pay.get("data")
+                batch_ts = float(pay.get("timestamp") or 0)
+                batch_ts = batch_ts / 1000.0 if batch_ts > 1e12 else batch_ts
+                if isinstance(pts, list) and pts and isinstance(pts[0], dict):
+                    for pt in pts:
+                        try:
+                            v = float(pt.get("value", pt.get("price")))
+                            ts = float(pt.get("timestamp", batch_ts))
+                            ts = ts / 1000.0 if ts > 1e12 else ts
+                            clp[asset].append((ts, v, recv))
+                        except Exception:
+                            pass
+                elif pay.get("value") is not None:
+                    try:
+                        clp[asset].append((batch_ts, float(pay["value"]), recv))
+                    except Exception:
+                        pass
+        print(f"  [{day}] просканировано строк: binance {scanned['binance']:,}, rtds {scanned['rtds']:,}", flush=True)
+    for x in assets:
+        tb[x].sort(key=lambda r: r[0])
+        clp[x].sort(key=lambda r: r[0])
+    return tb, clp
 
 
 def minute_bars(trades):
@@ -108,12 +148,11 @@ def std(xs):
     return math.sqrt(sum((x - mu) ** 2 for x in xs) / (n - 1))
 
 
-def build_table(a, asset):
-    trades, fb = load_trades(a, asset)
+def build_table(a, asset, trades, cl):
+    fb = 0
     if len(trades) < 600:
         print(f"  [{asset}] мало тиков ({len(trades)}) — пропуск")
         return None
-    cl, cl_info = load_cl(a, asset)
     m1 = minute_bars(trades)
     bs = rollup(m1, a.tf)
     kmap = {m: (b[0], b[1], b[2], b[3], b[4], b[5], b[6]) for m, b in m1.items()}
@@ -178,6 +217,7 @@ def main():
     ap.add_argument("--floor-bps", type=float, default=4.7)
     ap.add_argument("--files", type=int, default=0, help="0 = все файлы дня (рекомендуется)")
     ap.add_argument("--outdir", default="/tmp/ds")
+    ap.add_argument("--cache", default="", help="папка локального кэша; '' = без кэша")
     a = ap.parse_args()
     a.days_list = K.days_of(argparse.Namespace(days=a.days, day=None, mode="x")) if hasattr(K, "days_of") else []
     if not a.days_list:
@@ -186,6 +226,26 @@ def main():
         d0 = dt.datetime.strptime(x, "%Y%m%d"); d1 = dt.datetime.strptime(y, "%Y%m%d")
         a.days_list = [(d0 + dt.timedelta(i)).strftime("%Y%m%d") for i in range((d1 - d0).days + 1)]
     a.horizons_min = [int(float(x)) for x in str(a.horizons).split(",")]
+    if a.cache:
+        K.CACHE = a.cache
+        import subprocess
+        for stream in ("binance", "rtds"):
+            for day in a.days_list:
+                dst = os.path.join(a.cache, a.bucket, a.prefix, stream, day)
+                done = os.path.join(dst, ".done")
+                if os.path.exists(done):
+                    print(f"  кэш {stream}/{day}: уже скачан, пропуск")
+                    continue
+                os.makedirs(dst, exist_ok=True)
+                print(f"  sync {stream}/{day} -> {dst} ...", flush=True)
+                r = subprocess.run(
+                    f"aws s3 sync s3://{a.bucket}/{a.prefix}/{stream}/{day}/ {dst}/",
+                    shell=True)
+                if r.returncode != 0:
+                    print(f"  WARNING: sync {stream}/{day} вернул {r.returncode} — "
+                          f"этот день будет читаться из S3 напрямую")
+                else:
+                    open(done, "w").write("ok")
     os.makedirs(a.outdir, exist_ok=True)
     print(f"# dataset v{VERSION}: дни {a.days_list[0]}..{a.days_list[-1]}  tf={a.tf}s  "
           f"floor={a.floor_bps} б.п.  метки {a.horizons_min}м")
@@ -202,8 +262,10 @@ def main():
                         "hour_sin/hour_cos": "время суток", "close": "цена закрытия бара",
                         "move_bps_*m": "будущее движение (метка!)",
                         "dir_*m": "1/-1 (метка!)", "cls_*m": "1/0/-1 с порогом flat (метка!)"}}
-    for asset in [s.strip().lower() for s in a.assets.split(",") if s.strip()]:
-        rows = build_table(a, asset)
+    assets = [s.strip().lower() for s in a.assets.split(",") if s.strip()]
+    trades_by, cl_by = collect(a, assets)
+    for asset in assets:
+        rows = build_table(a, asset, trades_by[asset], cl_by[asset])
         if not rows:
             continue
         cols = list(rows[0].keys())
