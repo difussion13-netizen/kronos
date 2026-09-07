@@ -130,7 +130,13 @@ def cmd_probe(a):
             t, raw = parse_rec(line)
             if raw is None:
                 continue
-            s = json.dumps(skel(raw), ensure_ascii=False)
+            lit = ""
+            for src in ((raw if isinstance(raw, dict) else {}),
+                        (raw.get("payload") if isinstance(raw, dict) and isinstance(raw.get("payload"), dict) else {})):
+                for k in ("topic", "type", "symbol", "stream"):
+                    if k in src and isinstance(src[k], (str, int, float)):
+                        lit += f" [{k}={src[k]}]"
+            s = json.dumps(skel(raw), ensure_ascii=False) + lit
             hist[s] += 1
             first.setdefault(s, raw if not isinstance(raw, list) else raw[0])
             n += 1
@@ -216,45 +222,57 @@ def load_binance_series(a, day, sym):
 
 
 def load_chainlink(a, day, sym):
-    """[(ts_event_s, price, ts_recv_s)] из rtds — формат батча:
-    raw = {"topic":"crypto_prices_chainlink","type":...,"payload":
-             {"symbol":"BTC/USD","timestamp":ms,"data":[{"timestamp":ms,"value":p},...]}}
-    Точка без собственного timestamp берёт время батча; recv — из конверта t."""
+    """[(ts_event_s, price, ts_recv_s)] из rtds + (реестр топиков, кол-во строк).
+
+    Реальные RTDS-сообщения: батчи {"topic":?,"type":?,"payload":{"symbol","timestamp",
+    "data":[{"timestamp","value"},…]}}. Точное имя топика для chainlink мы угадать не
+    обязаны: сопоставляем БАЗУ символа (btc/usd, BTC/USD, btcusdt, BTCUSDT -> "btc"),
+    а в приоритете строки, где topic/type содержит 'chainlink'. Если их нет — берём
+    все батчи этого символа (и честно сообщаем в реестре топиков, что видели)."""
     files = [n for n, _ in day_files(a.bucket, a.prefix, "rtds", day)][-a.files:]
-    want = sym.lower()
-    out = []
+    def base(x):
+        x = str(x).lower().replace("/", "")
+        return re.sub(r"(usdt|usdc|usd)$", "", x)
+    want = base(sym)
+    rows, topics, scanned = [], Counter(), 0
     for f in files:
         for line in iter_lines(a.bucket, a.prefix, "rtds", day, f):
             t, raw = parse_rec(line)
             if not isinstance(raw, dict):
                 continue
-            if "chainlink" not in str(raw.get("topic", "")).lower():
-                continue
+            scanned += 1
             pay = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
-            if str(pay.get("symbol", "")).lower() != want:
+            if not isinstance(pay, dict) or base(pay.get("symbol", "?")) != want:
                 continue
+            topics[f"{raw.get('topic','?')} / {raw.get('type','?')}"] += 1
+            cl = "chainlink" in (str(raw.get("topic", "")) + str(raw.get("type", ""))).lower()
+            slash = "/" in str(pay.get("symbol", ""))   # «ETH/USD» = оракул; «ETHUSDT» = relay Binance
             recv = (t or 0) / 1e9
             def norm(ms):
                 v = float(ms)
                 return v / 1000.0 if v > 1e12 else v
             pts = pay.get("data")
+            batch_ts = norm(pay.get("timestamp", raw.get("timestamp", 0)))
             if isinstance(pts, list) and pts and isinstance(pts[0], dict):
                 for pt in pts:
                     try:
-                        px = float(pt.get("value", pt.get("price")))
-                        ts = norm(pt.get("timestamp", pay.get("timestamp")))
-                        out.append((ts, px, recv))
+                        rows.append((1 if cl else (2 if slash else 3),
+                                     norm(pt.get("timestamp", batch_ts)),
+                                     float(pt.get("value", pt.get("price"))), recv))
                     except Exception:
                         pass
-            else:
+            elif pay.get("value") is not None or pay.get("price") is not None:
                 try:
-                    px = float(pay.get("value", pay.get("price")))
-                    ts = norm(pay.get("timestamp", raw.get("timestamp")))
-                    out.append((ts, px, recv))
+                    rows.append((1 if cl else (2 if slash else 3),
+                                 batch_ts, float(pay.get("value", pay.get("price"))), recv))
                 except Exception:
                     pass
-    out.sort(key=lambda x: x[0])
-    return out
+    pick = {1: [r for r in rows if r[0] == 1], 2: [r for r in rows if r[0] in (1, 2)]}
+    chosen = pick[1] if pick[1] else (pick[2] if pick[2] else rows)
+    series = sorted(((ts, px, rc) for _, ts, px, rc in chosen), key=lambda x: x[0])
+    src = "chainlink-topic" if pick[1] else ("symbol-only(slash)" if pick[2] else ("none" if not rows else "ALL(suspect!)"))
+    info = dict(topics=dict(topics), rows_match=len(rows), rows_scanned=scanned, source=src)
+    return series, info
 
 
 def bisect_left(arr, x, key):
@@ -292,11 +310,13 @@ def fmt(v, nd=2, suffix=""):
 def cmd_lag(a):
     bn_s, fb = load_binance_series(a, a.day, a.sym)   # btc/usd → btcusdt внутри
     bn = [(ts, px) for ts, px, _ in bn_s]
-    cl = load_chainlink(a, a.day, a.sym)
+    cl, info = load_chainlink(a, a.day, a.sym)
     print(f"# lag {a.sym}: binance-записей {len(bn)} (ts по событию; из приёма {fb}), "
-          f"chainlink {len(cl)} (файлов по {a.files})")
+          f"chainlink {len(cl)} (источник: {info['source']}; файлов по {a.files})")
+    if info["rows_scanned"] and not info["rows_match"]:
+        print(f"  в rtds этого дня нет строк для символа {a.sym}; топик/тип строк: {info['topics']}")
     if not cl or not bn:
-        print("одного из рядов нет — запусти `probe --stream rtds/binance` и пришли вывод")
+        print("одного из рядов нет — пришли вывод этой шапки (я допишу матчинг под реальные имена)")
         return
     lo, hi = max(bn[0][0], cl[0][0]), min(bn[-1][0], cl[-1][0])
     cl = [x for x in cl if lo <= x[0] <= hi]
@@ -448,8 +468,10 @@ def cmd_verify(a):
     if not kl:
         raise SystemExit("klines пустые")
     t_from = int(kl[0][0] // 1000 // 60 * 60)
-    a.day = __import__("datetime").datetime.utcfromtimestamp(t_from).strftime("%Y%m%d")
-    bn = load_binance_mid(a, a.day, sym)
+    import datetime as _dt
+    a.day = _dt.datetime.fromtimestamp(t_from, _dt.timezone.utc).strftime("%Y%m%d")
+    bn_s, _fb = load_binance_series(a, a.day, sym)
+    bn = [(ts, px) for ts, px, _ in bn_s]
     ours = dict((int(ts // 60) * 60, v) for ts, v in bn)
     diffs = []
     n = 0
