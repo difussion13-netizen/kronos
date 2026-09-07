@@ -181,7 +181,7 @@ def main():
         import datetime as _dt
         byday = {}
         for i in range(len(X)):
-            d = _dt.datetime.utcfromtimestamp(t[i] / 1000.0 if t[i] > 1e12 else t[i]).date()
+            d = _dt.datetime.fromtimestamp(t[i] / 1000.0 if t[i] > 1e12 else t[i], _dt.timezone.utc).date()
             byday.setdefault(d, []).append(i)
         days = sorted(byday)
         print(f"\n#walk-forward по дням ({len(days)} суток, warmup {a.warmup_days}):")

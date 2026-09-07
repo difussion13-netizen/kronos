@@ -245,7 +245,13 @@ def main():
                     print(f"  WARNING: sync {stream}/{day} вернул {r.returncode} — "
                           f"этот день будет читаться из S3 напрямую")
                 else:
-                    open(done, "w").write("ok")
+                    got = [f for f in os.listdir(dst) if f.endswith(".gz")]
+                    if got:
+                        open(done, "w").write(str(len(got)))
+                    else:  # день пуст (ещё не начался по UTC / ротации не было) —
+                        os.path.exists(done) and os.remove(done)
+                        # НЕ ставим .done: иначе завтра пропустим день как «скачанный»
+                        print(f"  {stream}/{day}: файлов пока нет — пропустим без отметки")
     os.makedirs(a.outdir, exist_ok=True)
     print(f"# dataset v{VERSION}: дни {a.days_list[0]}..{a.days_list[-1]}  tf={a.tf}s  "
           f"floor={a.floor_bps} б.п.  метки {a.horizons_min}м")
