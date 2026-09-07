@@ -172,32 +172,54 @@ def cmd_stats(a):
 
 # ---------------------------------------------------------------- time series
 
-def load_binance_mid(a, day, sym):
-    """[(ts_s, mid)] — из bookTicker; sym напр. btcusdt. Берём с хвоста файлов
-    (--files N последних), чтобы не грузить день целиком."""
-    stream = to_binance_sym(sym) + "@bookticker"
+def load_binance_series(a, day, sym):
+    """[(ts_s, price, vol)] из наших binance-записей: aggTrade (осн.) + depth5 (mid).
+
+    Возвращает отсортированный ряд; ts — время события из самого сообщения,
+    если его нет — время приёма (конверт t), с пометкой не делаем: это тот же
+    источник, что видит резолвер, наносекунды тут не важны."""
+    want_base = to_binance_sym(sym)                      # btcusdt
     files = [n for n, _ in day_files(a.bucket, a.prefix, "binance", day)][-a.files:]
-    out = []
+    out, fallback = [], 0
     for f in files:
         for line in iter_lines(a.bucket, a.prefix, "binance", day, f):
-            _, raw = parse_rec(line)
-            if not isinstance(raw, dict) or raw.get("stream", "").lower() != stream:
+            t, raw = parse_rec(line)
+            if not isinstance(raw, dict) or "stream" not in raw:
                 continue
-            d = raw.get("data", {})
+            st = str(raw["stream"]).lower()
+            if not st.startswith(want_base + "@"):
+                continue
+            d = raw.get("data") or {}
             try:
-                mid = (float(d["b"]) + float(d["a"])) / 2.0
-                ts = float(d.get("E", 0)) / 1000.0
+                if st.endswith("@aggtrade"):
+                    px = float(d["p"]); vol = float(d.get("q", 0) or 0)
+                    ts = float(d.get("T") or d.get("E") or 0) / 1000.0
+                elif "@depth" in st:
+                    bids = d.get("bids") or d.get("b") or []
+                    asks = d.get("asks") or d.get("a") or []
+                    if not bids or not asks:
+                        continue
+                    px = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                    vol = 0.0
+                    ts = float(d.get("T") or d.get("E") or 0) / 1000.0
+                else:            # kline_1m и прочее — не для потока цен
+                    continue
+                if not ts:
+                    ts = (t or 0) / 1e9
+                    fallback += 1
                 if ts > 1e9:
-                    out.append((ts, mid))
+                    out.append((ts, px, vol))
             except Exception:
                 pass
     out.sort(key=lambda x: x[0])
-    return out
+    return out, fallback
 
 
 def load_chainlink(a, day, sym):
-    """[(ts_event_s, price, ts_recv_s)] из rtds для пары вида btc/usd.
-    Поля угаданы с фолбэками; если пусто — запусти `probe --stream rtds`."""
+    """[(ts_event_s, price, ts_recv_s)] из rtds — формат батча:
+    raw = {"topic":"crypto_prices_chainlink","type":...,"payload":
+             {"symbol":"BTC/USD","timestamp":ms,"data":[{"timestamp":ms,"value":p},...]}}
+    Точка без собственного timestamp берёт время батча; recv — из конверта t."""
     files = [n for n, _ in day_files(a.bucket, a.prefix, "rtds", day)][-a.files:]
     want = sym.lower()
     out = []
@@ -206,27 +228,31 @@ def load_chainlink(a, day, sym):
             t, raw = parse_rec(line)
             if not isinstance(raw, dict):
                 continue
+            if "chainlink" not in str(raw.get("topic", "")).lower():
+                continue
             pay = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
-            s = str(pay.get("symbol", pay.get("crypto_symbol", ""))).lower()
-            if s != want:
+            if str(pay.get("symbol", "")).lower() != want:
                 continue
-            def pick(d, keys, default=None):
-                for k in keys:
-                    if k in d and d[k] is not None:
-                        return d[k]
-                return default
-            price = pick(pay, ("price", "value"))
-            ts = pick(pay, ("timestamp", "ts", "updatedAt"), pick(raw, ("timestamp", "ts",)))
-            try:
-                price = float(price)
-            except Exception:
-                continue
-            if ts is None:
-                continue
-            ts = float(ts)
-            if ts > 1e12:  # ms
-                ts /= 1000.0
-            out.append((ts, price, (t or 0) / 1e9))
+            recv = (t or 0) / 1e9
+            def norm(ms):
+                v = float(ms)
+                return v / 1000.0 if v > 1e12 else v
+            pts = pay.get("data")
+            if isinstance(pts, list) and pts and isinstance(pts[0], dict):
+                for pt in pts:
+                    try:
+                        px = float(pt.get("value", pt.get("price")))
+                        ts = norm(pt.get("timestamp", pay.get("timestamp")))
+                        out.append((ts, px, recv))
+                    except Exception:
+                        pass
+            else:
+                try:
+                    px = float(pay.get("value", pay.get("price")))
+                    ts = norm(pay.get("timestamp", raw.get("timestamp")))
+                    out.append((ts, px, recv))
+                except Exception:
+                    pass
     out.sort(key=lambda x: x[0])
     return out
 
@@ -264,10 +290,11 @@ def fmt(v, nd=2, suffix=""):
 # ---------------------------------------------------------------- lag
 
 def cmd_lag(a):
-    bn = load_binance_mid(a, a.day, a.sym)   # btc/usd → btcusdt внутри
+    bn_s, fb = load_binance_series(a, a.day, a.sym)   # btc/usd → btcusdt внутри
+    bn = [(ts, px) for ts, px, _ in bn_s]
     cl = load_chainlink(a, a.day, a.sym)
-    print(f"# lag {a.sym}: binance-записей {len(bn)}, chainlink {len(cl)} "
-          f"(файлов по {a.files})")
+    print(f"# lag {a.sym}: binance-записей {len(bn)} (ts по событию; из приёма {fb}), "
+          f"chainlink {len(cl)} (файлов по {a.files})")
     if not cl or not bn:
         print("одного из рядов нет — запусти `probe --stream rtds/binance` и пришли вывод")
         return
@@ -393,9 +420,9 @@ def cmd_candles(a):
         bs = bars_from_trades(tr, a.tf)
         src = f"clob last_trade ({len(tr)} сделок)"
     else:
-        bn = load_binance_mid(a, a.day, sym)
-        bs = bars_from_mid(bn, a.tf)
-        src = f"binance bookTicker mid ({len(bn)} тиков)"
+        bn, _fb = load_binance_series(a, a.day, sym)
+        bs = bars_from_trades([(ts, px, v) for ts, px, v in bn if v > 0], a.tf)
+        src = f"binance aggTrade ({len(bn)} событий, {len(bs)} баров по сделкам)"
     print(f"# {sym} {a.tf}s-бары из {src}: {len(bs)} баров")
     print("first:", bs[:2])
     print("last: ", bs[-2:])
