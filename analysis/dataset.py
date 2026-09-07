@@ -39,7 +39,7 @@ def collect(a, assets):
     cl_of = {(x.upper() + "/USD"): x for x in assets}             # BTC/USD  -> btc
     scanned = {"binance": 0, "rtds": 0}
     for day in a.days_list:
-        for name, _ in K.files_of(a, "binance", [day]):
+        for _d, name in K.files_of(a, "binance", [day]):
             for line in K.iter_lines(a.bucket, a.prefix, "binance", day, name):
                 scanned["binance"] += 1
                 t, raw = K.parse_rec(line)
@@ -59,7 +59,7 @@ def collect(a, assets):
                     continue
                 if ts > 1e9:
                     tb[asset].append((ts, px, vol))
-        for name, _ in K.files_of(a, "rtds", [day]):
+        for _d, name in K.files_of(a, "rtds", [day]):
             for line in K.iter_lines(a.bucket, a.prefix, "rtds", day, name):
                 scanned["rtds"] += 1
                 t, raw = K.parse_rec(line)
