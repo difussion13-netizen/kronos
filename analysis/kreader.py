@@ -45,6 +45,27 @@ def to_binance_sym(sym):
     if not s.endswith("usdt"):
         s += "usdt"
     return s
+def days_of(a):
+    """--days A-B | --days A,B | --day A -> список дней."""
+    import datetime as _dt
+    spec = (a.days or a.day or "")
+    if "-" in spec:
+        x, y = spec.split("-", 1)
+        d0 = _dt.datetime.strptime(x, "%Y%m%d")
+        d1 = _dt.datetime.strptime(y, "%Y%m%d")
+        return [(d0 + _dt.timedelta(d)).strftime("%Y%m%d") for d in range((d1 - d0).days + 1)]
+    return [d for d in spec.split(",") if d]
+
+
+def files_of(a, stream, days):
+    out = []
+    for d in days:
+        out += [(d, n) for n, _ in day_files(a.bucket, a.prefix, stream, d)]
+    if a.files:
+        out = out[-int(a.files) * len(days):]
+    return out
+
+
 FKEY_RE = re.compile(r"^(?P<stream>[a-z_]+?)_(?P<day>\d{8})_(?P<time>\d{6})\.jsonl\.gz$")
 
 
@@ -146,7 +167,8 @@ def cmd_probe(a):
             break
     print(f"# probe {a.stream}/{a.day}: {n} строк из {min(a.tail, len(files))} файлов\n")
     for shape, cnt in hist.most_common(12):
-        print(f"[{cnt:>7}x] {shape[:200]}")
+        sep = shape.index("  [") if "  [" in shape else len(shape)
+        print(f"[{cnt:>7}x] {shape[:200] if sep>200 else shape[:sep]}{shape[sep:]}")
         print("      пример:", json.dumps(first[shape], ensure_ascii=False)[:400], "\n")
 
 
@@ -178,16 +200,16 @@ def cmd_stats(a):
 
 # ---------------------------------------------------------------- time series
 
-def load_binance_series(a, day, sym):
+def load_binance_series(a, days, sym):
     """[(ts_s, price, vol)] из наших binance-записей: aggTrade (осн.) + depth5 (mid).
 
     Возвращает отсортированный ряд; ts — время события из самого сообщения,
     если его нет — время приёма (конверт t), с пометкой не делаем: это тот же
     источник, что видит резолвер, наносекунды тут не важны."""
     want_base = to_binance_sym(sym)                      # btcusdt
-    files = [n for n, _ in day_files(a.bucket, a.prefix, "binance", day)][-a.files:]
+    files = files_of(a, "binance", days)
     out, fallback = [], 0
-    for f in files:
+    for day, f in files:
         for line in iter_lines(a.bucket, a.prefix, "binance", day, f):
             t, raw = parse_rec(line)
             if not isinstance(raw, dict) or "stream" not in raw:
@@ -221,7 +243,7 @@ def load_binance_series(a, day, sym):
     return out, fallback
 
 
-def load_chainlink(a, day, sym):
+def load_chainlink(a, days, sym):
     """[(ts_event_s, price, ts_recv_s)] из rtds + (реестр топиков, кол-во строк).
 
     Реальные RTDS-сообщения: батчи {"topic":?,"type":?,"payload":{"symbol","timestamp",
@@ -229,24 +251,30 @@ def load_chainlink(a, day, sym):
     обязаны: сопоставляем БАЗУ символа (btc/usd, BTC/USD, btcusdt, BTCUSDT -> "btc"),
     а в приоритете строки, где topic/type содержит 'chainlink'. Если их нет — берём
     все батчи этого символа (и честно сообщаем в реестре топиков, что видели)."""
-    files = [n for n, _ in day_files(a.bucket, a.prefix, "rtds", day)][-a.files:]
+    files = files_of(a, "rtds", days)
     def base(x):
         x = str(x).lower().replace("/", "")
         return re.sub(r"(usdt|usdc|usd)$", "", x)
     want = base(sym)
-    rows, topics, scanned = [], Counter(), 0
-    for f in files:
+    rows, topics, syms, scanned = [], Counter(), Counter(), 0
+    for day, f in files:
         for line in iter_lines(a.bucket, a.prefix, "rtds", day, f):
             t, raw = parse_rec(line)
             if not isinstance(raw, dict):
                 continue
             scanned += 1
             pay = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
-            if not isinstance(pay, dict) or base(pay.get("symbol", "?")) != want:
+            if not isinstance(pay, dict):
                 continue
-            topics[f"{raw.get('topic','?')} / {raw.get('type','?')}"] += 1
-            cl = "chainlink" in (str(raw.get("topic", "")) + str(raw.get("type", ""))).lower()
-            slash = "/" in str(pay.get("symbol", ""))   # «ETH/USD» = оракул; «ETHUSDT» = relay Binance
+            topic = str(pay.get("topic", raw.get("topic", "?")))
+            typ = str(pay.get("type", raw.get("type", "?")))
+            symv = str(pay.get("symbol", raw.get("symbol", "?")))
+            syms[symv] += 1
+            if base(symv) != want:
+                continue
+            topics[f"{topic} / {typ}"] += 1
+            cl = "chainlink" in (topic + typ).lower()
+            slash = "/" in symv                          # «ETH/USD» = оракул; «ETHUSDT» = relay Binance
             recv = (t or 0) / 1e9
             def norm(ms):
                 v = float(ms)
@@ -271,7 +299,8 @@ def load_chainlink(a, day, sym):
     chosen = pick[1] if pick[1] else (pick[2] if pick[2] else rows)
     series = sorted(((ts, px, rc) for _, ts, px, rc in chosen), key=lambda x: x[0])
     src = "chainlink-topic" if pick[1] else ("symbol-only(slash)" if pick[2] else ("none" if not rows else "ALL(suspect!)"))
-    info = dict(topics=dict(topics), rows_match=len(rows), rows_scanned=scanned, source=src)
+    info = dict(topics=dict(topics), symbols=dict(syms.most_common(8)),
+                rows_match=len(rows), rows_scanned=scanned, source=src)
     return series, info
 
 
@@ -308,13 +337,18 @@ def fmt(v, nd=2, suffix=""):
 # ---------------------------------------------------------------- lag
 
 def cmd_lag(a):
-    bn_s, fb = load_binance_series(a, a.day, a.sym)   # btc/usd → btcusdt внутри
+    days = days_of(a)
+    bn_s, fb = load_binance_series(a, days, a.sym)   # btc/usd -> btcusdt внутри
     bn = [(ts, px) for ts, px, _ in bn_s]
-    cl, info = load_chainlink(a, a.day, a.sym)
+    cl, info = load_chainlink(a, days, a.sym)
     print(f"# lag {a.sym}: binance-записей {len(bn)} (ts по событию; из приёма {fb}), "
           f"chainlink {len(cl)} (источник: {info['source']}; файлов по {a.files})")
     if info["rows_scanned"] and not info["rows_match"]:
-        print(f"  в rtds этого дня нет строк для символа {a.sym}; топик/тип строк: {info['topics']}")
+        print(f"  в rtds нет строк для {a.sym}; символы, которые есть: {info['symbols']}; "
+              f"топики: {info['topics']}")
+    elif 0 < len(cl) < 60:
+        print(f"  внимание: выборка Chainlink мала ({len(cl)} точек) — расширь --days (напр. "
+              f"--days 20260904-20260907) и поставь --files 0 (все файлы дня)")
     if not cl or not bn:
         print("одного из рядов нет — пришли вывод этой шапки (я допишу матчинг под реальные имена)")
         return
@@ -379,12 +413,11 @@ def cmd_lag(a):
 
 # ---------------------------------------------------------------- candles / verify
 
-def load_last_trades(a, day, token_ids):
+def load_last_trades(a, days, token_ids):
     """[(ts_s, price, size)] из clob last_trade для заданных asset_id."""
-    files = [n for n, _ in day_files(a.bucket, a.prefix, "clob", day)][-a.files:]
     out = []
     want = set(str(t) for t in token_ids) if token_ids else None
-    for f in files:
+    for day, f in files_of(a, "clob", days):
         for line in iter_lines(a.bucket, a.prefix, "clob", day, f):
             _, raw = parse_rec(line)
             if isinstance(raw, list):
@@ -434,13 +467,14 @@ def bars_from_mid(series, tf=60):
 
 def cmd_candles(a):
     sym = a.sym if "/" in a.sym else a.sym
+    a_days = days_of(a)
     if a.tokens:
         ids = a.tokens.split(",")
-        tr = load_last_trades(a, a.day, ids)
+        tr = load_last_trades(a, a_days, ids)
         bs = bars_from_trades(tr, a.tf)
         src = f"clob last_trade ({len(tr)} сделок)"
     else:
-        bn, _fb = load_binance_series(a, a.day, sym)
+        bn, _fb = load_binance_series(a, a_days, sym)
         bs = bars_from_trades([(ts, px, v) for ts, px, v in bn if v > 0], a.tf)
         src = f"binance aggTrade ({len(bn)} событий, {len(bs)} баров по сделкам)"
     print(f"# {sym} {a.tf}s-бары из {src}: {len(bs)} баров")
@@ -469,8 +503,8 @@ def cmd_verify(a):
         raise SystemExit("klines пустые")
     t_from = int(kl[0][0] // 1000 // 60 * 60)
     import datetime as _dt
-    a.day = _dt.datetime.fromtimestamp(t_from, _dt.timezone.utc).strftime("%Y%m%d")
-    bn_s, _fb = load_binance_series(a, a.day, sym)
+    vday = _dt.datetime.fromtimestamp(t_from, _dt.timezone.utc).strftime("%Y%m%d")
+    bn_s, _fb = load_binance_series(a, [vday], sym)
     bn = [(ts, px) for ts, px, _ in bn_s]
     ours = dict((int(ts // 60) * 60, v) for ts, v in bn)
     diffs = []
@@ -524,8 +558,10 @@ def main():
             a.days = (a.days or a.day or "").split(",")
         cmd_stats(a)
         return
-    if not a.day and a.mode != "verify":
-        raise SystemExit("нужен --day (YYYYMMDD)")
+    if not (a.day or a.days) and a.mode != "verify":
+        raise SystemExit("нужен --day YYYYMMDD или --days A-B")
+    if not a.day and a.days:
+        a.day = days_of(a)[0]
     {"probe": cmd_probe, "lag": cmd_lag, "candles": cmd_candles, "verify": cmd_verify}[a.mode](a)
 
 
