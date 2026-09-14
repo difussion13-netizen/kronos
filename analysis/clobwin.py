@@ -21,6 +21,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 RX_ID = re.compile(rb'"asset_id":"(\d+)"')
@@ -69,43 +71,120 @@ HDRS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) kronos-research/1.0",
         "Accept": "application/json"}
 
 
-def gamma_map(ids, gamma):
+def _mkinfo(mk):
+    slug = mk.get("slug") or ""
+    s = SLUG_RE.match(slug)
+    if not s or s.group(2) not in CODE_S:
+        return
+    toks = mk.get("clobTokenIds")
+    outs = mk.get("outcomes")
+    try:
+        toks = json.loads(toks) if isinstance(toks, str) else (toks or [])
+        outs = json.loads(outs) if isinstance(outs, str) else (outs or [])
+        up = outs.index("Up")
+    except Exception:
+        up = 0
+    for k, t in enumerate(toks):
+        yield str(t), {"slug": slug, "asset": s.group(1), "code": s.group(2),
+                       "start": int(s.group(3)), "up": (k == up)}
+
+
+def gamma_map(ids, gamma, batch=8, threads=8):
+    """token-id -> {slug, asset, code, start, up}.
+
+    Gamma на некоторых IP/пулах отвергает длинные запросы (422 на батч из 40
+    id, при этом поштучно 200), поэтому перебираем форматы: повторяющийся
+    параметр, запятые по 20/5, поштучно нитями. Формат, разметивший <50%
+    или вернувший 4xx, считается непригодным — идём дальше по остатку."""
+    ids = sorted(set(str(x) for x in ids))
     m = {}
-    ids = sorted(ids)
-    fails = 0
-    for i in range(0, len(ids), 40):
-        q = ",".join(ids[i:i + 40])
-        try:
-            req = urllib.request.Request(f"{gamma}/markets?clob_token_ids={q}", headers=HDRS)
-            with urllib.request.urlopen(req, timeout=20) as r:
-                arr = json.loads(r.read().decode())
-        except Exception as e:
-            fails += 1
-            if fails == 1:
-                print(f"  gamma batch {i}: {e}", file=sys.stderr)
-            continue
-        for mk in arr:
-            slug = mk.get("slug") or ""
-            s = SLUG_RE.match(slug)
-            if not s or s.group(2) not in CODE_S:
-                continue
-            toks = mk.get("clobTokenIds")
-            outs = mk.get("outcomes")
+
+    def fetch(url):
+        for att in range(3):
             try:
-                toks = json.loads(toks) if isinstance(toks, str) else (toks or [])
-                outs = json.loads(outs) if isinstance(outs, str) else (outs or [])
-                up = outs.index("Up")
+                req = urllib.request.Request(url, headers=HDRS)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.loads(r.read().decode()), None
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503):
+                    time.sleep(1.5 * (att + 1))
+                    continue
+                return None, e.code
             except Exception:
-                up = 0
-            for k, t in enumerate(toks):
-                m[str(t)] = {"slug": slug, "asset": s.group(1), "code": s.group(2),
-                             "start": int(s.group(3)), "up": (k == up)}
-        print(f"  gamma: размечено {min(i + 40, len(ids))}/{len(ids)} токенов", flush=True)
-    if fails and not m:
-        raise SystemExit(
-            "Gamma недоступна с этого IP/UA. План Б — запускать clobwin на сервере\n"
-            "логгера (там Gamma работает):  scp скрипт, либо git clone + python3\n"
-            "clobwin.py --bucket ... --day ...; детали в docs/plan-4-evals.md.")
+                return None, "net"
+        return None, "retry"
+
+    def absorb(arr):
+        for mk in arr or []:
+            for t, v in _mkinfo(mk):
+                m[t] = v
+
+    def multi(ch):
+        return gamma + "/markets?" + "&".join("clob_token_ids=" + t for t in ch)
+
+    def comma(ch):
+        return gamma + "/markets?clob_token_ids=" + ",".join(ch)
+
+    for name, size, url_of in [("multi", max(1, batch), multi), ("comma", 20, comma),
+                               ("comma", 5, comma), ("single", 1, comma)]:
+        ts = [t for t in ids if t not in m]
+        if not ts:
+            break
+        before = len(m)
+        chunks = [ts[i:i + size] for i in range(0, len(ts), size)]
+        npar = threads if size == 1 else 1
+        print(f"  gamma/{name}: {len(ts)} id пачками по {size} (~{len(chunks)} "
+              f"запросов, нитей {npar})", flush=True)
+        rejected, errs, err = False, 0, None
+        if npar > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=npar) as ex:
+                for j, (arr, err) in enumerate(ex.map(
+                        lambda ch: fetch(url_of(ch)), chunks)):
+                    if err == 403:
+                        print("  gamma: 403 — IP отрезан; останавливаюсь",
+                              file=sys.stderr)
+                        return m
+                    if err:
+                        errs += 1
+                        if errs > max(30, len(chunks) // 5):
+                            rejected = True
+                            break
+                    else:
+                        absorb(arr)
+                    if j and j % 2000 == 0:
+                        print(f"  gamma/{name}: размечено {len(m)}/{len(ids)}",
+                              flush=True)
+        else:
+            for j, ch in enumerate(chunks):
+                arr, err = fetch(url_of(ch))
+                if err == 403:
+                    print("  gamma: 403 — IP отрезан; останавливаюсь",
+                          file=sys.stderr)
+                    return m
+                if err:
+                    if size > 1 and err in (400, 414, 422):
+                        rejected = True
+                        break
+                    errs += 1
+                    if errs > max(30, len(chunks) // 5):
+                        rejected = True
+                        break
+                else:
+                    absorb(arr)
+                if j and j % 200 == 0:
+                    print(f"  gamma/{name}: размечено {len(m)}/{len(ids)}",
+                          flush=True)
+        cov = (len(m) - before) / max(1, len(ts))
+        if rejected:
+            print(f"  gamma/{name}: формат не принят (первая ошибка {err}); "
+                  f"пробую мельче", flush=True)
+        elif cov < 0.5:
+            print(f"  gamma/{name}: разметил лишь {100*cov:.0f}% — пробую дальше",
+                  flush=True)
+        elif cov >= 1:
+            break
+    print(f"  gamma: итог размечено {len(m)} из {len(ids)}", flush=True)
     return m
 
 
@@ -270,26 +349,36 @@ def do_minutes(a, day, assets):
 
 
 def _collect_worker(args):
-    bucket, prefix, day = args
+    bucket, prefix, day, outdir, force = args
+    idf = os.path.join(outdir, f"ids_{day}.txt")
+    if force and os.path.exists(idf):
+        os.remove(idf)
+    if os.path.exists(idf):
+        return day, set(open(idf).read().split())
     files = day_files(bucket, prefix, "clob", day)
     if not files:
         return day, set()
-    seen = set()
-    for name in files:
+    seen, nf = set(), len(files)
+    for fi, name in enumerate(files):
         for ln in iter_lines(bucket, prefix, "clob", day, name):
             m = RX_ID.search(ln)
             if m:
                 seen.add(m.group(1).decode())
+        if fi % 20 == 19 or fi + 1 == nf:
+            print(f"  [{day}/passA] файл {fi+1}/{nf}, токенов {len(seen)}",
+                  flush=True)
+    with open(idf, "w") as f:
+        f.write("\n".join(sorted(seen)))
     return day, seen
 
 
 def _run_worker(args):
-    bucket, prefix, day, outdir, tokmap, do_minutes, assets = args
+    bucket, prefix, day, outdir, tokmap, minutes, assets = args
     ns = argparse.Namespace(bucket=bucket, prefix=prefix, outdir=outdir)
     files = day_files(bucket, prefix, "clob", day)
     if files:
         run_day(ns, day, tokmap)
-    if do_minutes:
+    if minutes:
         do_minutes(ns, day, set(assets))
     return day
 
@@ -302,6 +391,10 @@ def main():
     ap.add_argument("--days", help="A-B или список")
     ap.add_argument("--outdir", default="/tmp/win")
     ap.add_argument("--gamma", default="https://gamma-api.polymarket.com")
+    ap.add_argument("--gamma-batch", type=int, default=8,
+                    help="старт. размер батча повторяющегося параметра Gamma")
+    ap.add_argument("--gamma-threads", type=int, default=8,
+                    help="нитей в поштучном фолбэке Gamma")
     ap.add_argument("--minutes", action="store_true")
     ap.add_argument("--jobs", type=int, default=1, help="0=все ядра; параллелизм ПО СУТКАМ")
     ap.add_argument("--map-only", action="store_true",
@@ -342,12 +435,15 @@ def main():
         with mp.Pool(min(jobs, max(1, len(days)))) as pool:
             seen = set()
             for day, ids in pool.imap_unordered(_collect_worker,
-                                                 [(a.bucket, a.prefix, d) for d in days]):
+                                                 [(a.bucket, a.prefix, d, a.outdir,
+                                                   a.rescan) for d in days]):
                 print(f"  [{day}/passA] токенов {len(ids)}", flush=True)
                 seen |= ids
         fresh = [x for x in seen if x not in tokmap]
         if fresh:
-            tokmap.update(gamma_map(fresh, a.gamma))
+            tokmap.update(gamma_map(fresh, a.gamma, a.gamma_batch, a.gamma_threads))
+        if fresh and not tokmap:
+            raise SystemExit("Gamma не отвечает с этого IP — проверь curl -w %{http_code}")
         json.dump(tokmap, open(map_path, "w"))
         print(f"карта: {len(tokmap)} токенов")
         if a.map_s3:
@@ -364,7 +460,7 @@ def main():
         if not ids:
             raise SystemExit("нет ids_unmapped — сначала запуска clobwin на расчётной машине")
         fresh = [x for x in ids if x not in tokmap]
-        tokmap.update(gamma_map(fresh, a.gamma))
+        tokmap.update(gamma_map(fresh, a.gamma, a.gamma_batch, a.gamma_threads))
         json.dump(tokmap, open(map_path, "w"))
         if a.map_s3:
             subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
@@ -377,12 +473,13 @@ def main():
         with mp.Pool(min(jobs, len(need_ids))) as pool:
             seen = set()
             for day, ids in pool.imap_unordered(_collect_worker,
-                                                 [(a.bucket, a.prefix, d) for d in need_ids]):
+                                                 [(a.bucket, a.prefix, d, a.outdir,
+                                                   a.rescan) for d in need_ids]):
                 print(f"  [{day}/passA] токенов {len(ids)}", flush=True)
                 seen |= ids
         fresh = [x for x in seen if x not in tokmap]
         if fresh:
-            tokmap.update(gamma_map(fresh, a.gamma))
+            tokmap.update(gamma_map(fresh, a.gamma, a.gamma_batch, a.gamma_threads))
             json.dump(tokmap, open(map_path, "w"))
             if a.map_s3:
                 subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
