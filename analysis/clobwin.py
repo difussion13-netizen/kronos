@@ -98,7 +98,8 @@ def gamma_map(ids, gamma):
 
 def collect_ids(a, day, files):
     seen, ev, n = set(), {}, 0
-    for name in files:
+    nf = len(files)
+    for fi, name in enumerate(files):
         for ln in iter_lines(a.bucket, a.prefix, "clob", day, name):
             n += 1
             mid = RX_ID.search(ln)
@@ -107,7 +108,9 @@ def collect_ids(a, day, files):
             mev = RX_EVENT.search(ln)
             if mev:
                 ev[mev.group(1).decode()] = ev.get(mev.group(1).decode(), 0) + 1
-    print(f"  [{day}/passA] строк {n:,}; токенов {len(seen)}; события {ev}", flush=True)
+        if fi % 20 == 19 or fi + 1 == nf:
+            print(f"  [{day}/passA] файл {fi+1}/{nf}, строк {n:,}, токенов {len(seen)}", flush=True)
+    print(f"  [{day}/passA] итог: строк {n:,}; токенов {len(seen)}; события {ev}", flush=True)
     return seen
 
 
@@ -124,7 +127,10 @@ def run_day(a, day, tokmap):
     files = day_files(a.bucket, a.prefix, "clob", day)
     wins = {}
     n_lines = matched = 0
-    for name in files:
+    nf = len(files)
+    for fi, name in enumerate(files):
+        if fi % 20 == 19 or fi + 1 == nf:
+            print(f"  [{day}/passC] файл {fi+1}/{nf}, строк {n_lines:,}, окон {len(wins)}", flush=True)
         for ln in iter_lines(a.bucket, a.prefix, "clob", day, name):
             n_lines += 1
             mid = RX_ID.search(ln)
@@ -221,7 +227,11 @@ def run_day(a, day, tokmap):
 def do_minutes(a, day, assets):
     rows = {b: {} for b in assets}
     n = 0
-    for name in day_files(a.bucket, a.prefix, "binance", day):
+    bf = day_files(a.bucket, a.prefix, "binance", day)
+    nb = len(bf)
+    for bi, name in enumerate(bf):
+        if bi % 40 == 39:
+            print(f"  [{day}/minutes] файл {bi+1}/{nb}, строк {n:,}", flush=True)
         for ln in iter_lines(a.bucket, a.prefix, "binance", day, name):
             if b"@aggTrade" not in ln:
                 continue
