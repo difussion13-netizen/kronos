@@ -30,9 +30,9 @@ RX_EVENT = re.compile(rb'"event_type":"(\w+)"')
 RX_BK = re.compile(rb'"bids":\[([^\]]*)\]')
 RX_AK = re.compile(rb'"asks":\[([^\]]*)\]')
 RX_CHGSEG = re.compile(rb'"changes":\[([^\]]*)\]')
-RX_PPS = re.compile(rb'"price":"([\d.]+)".*?"size":"([\d.]+)"')
+RX_PPS = re.compile(rb'"price":\s*"?([\d.]+)"?[^{}]*?"size":\s*"?([\d.]+)')
 RX_SIDE = re.compile(rb'"side":"(\w+)"')
-RX_LT = re.compile(rb'"price":"([\d.]+)","size":"([\d.]+)"')
+RX_LT = re.compile(rb'"price":\s*"?([\d.]+)"?[^}]*?"size":\s*"?([\d.]+)')
 RX_AGGT = re.compile(rb'"(btcusdt|ethusdt|solusdt|xrpusdt)@aggTrade"')
 
 CPS = {"5m": (240, 120, 60, 30, 15, 5, 0),
@@ -65,16 +65,24 @@ def iter_lines(bucket, prefix, stream, day, name):
     p.wait()
 
 
+HDRS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) kronos-research/1.0",
+        "Accept": "application/json"}
+
+
 def gamma_map(ids, gamma):
     m = {}
     ids = sorted(ids)
+    fails = 0
     for i in range(0, len(ids), 40):
         q = ",".join(ids[i:i + 40])
         try:
-            with urllib.request.urlopen(f"{gamma}/markets?clob_token_ids={q}", timeout=20) as r:
+            req = urllib.request.Request(f"{gamma}/markets?clob_token_ids={q}", headers=HDRS)
+            with urllib.request.urlopen(req, timeout=20) as r:
                 arr = json.loads(r.read().decode())
         except Exception as e:
-            print(f"  gamma batch {i}: {e}", file=sys.stderr)
+            fails += 1
+            if fails == 1:
+                print(f"  gamma batch {i}: {e}", file=sys.stderr)
             continue
         for mk in arr:
             slug = mk.get("slug") or ""
@@ -93,6 +101,11 @@ def gamma_map(ids, gamma):
                 m[str(t)] = {"slug": slug, "asset": s.group(1), "code": s.group(2),
                              "start": int(s.group(3)), "up": (k == up)}
         print(f"  gamma: размечено {min(i + 40, len(ids))}/{len(ids)} токенов", flush=True)
+    if fails and not m:
+        raise SystemExit(
+            "Gamma недоступна с этого IP/UA. План Б — запускать clobwin на сервере\n"
+            "логгера (там Gamma работает):  scp скрипт, либо git clone + python3\n"
+            "clobwin.py --bucket ... --day ...; детали в docs/plan-4-evals.md.")
     return m
 
 
@@ -150,7 +163,7 @@ def run_day(a, day, tokmap):
                                  "end": info["start"] + CODE_S.get(info["code"], 300)}
             ev = RX_EVENT.search(ln)
             ev = ev.group(1) if ev else b"?"
-            if ev == b"last_trade":                      # поток: оба токена — та же торговля
+            if ev.startswith(b"last_trade"):              # ..._price у реальных сообщений; оба токена — тот же рынок
                 w["n_lt"] += 1
                 ml = RX_LT.search(ln)
                 if ml:
