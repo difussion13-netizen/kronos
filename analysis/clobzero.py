@@ -125,11 +125,12 @@ def econ(rows):
 
 
 def calib(rows, per, bars, quote=False):
-    print("\n== E3: калибровка/миспрайсинг (цена up-токена vs realized freq) ==")
+    print("\n== E3: калибровка/миспрайсинг (цена up-токена vs realized freq; якорь — только информация до чекпоинта) ==")
     res = {}
     for c in [240, 120, 60, 30, 15]:
         bins = {}
         bm = ba = n = 0
+        byday = {}
         for r in rows:
             asset = r["asset"]; start = int(r["start"]); end = int(r["end"])
             m, _, _ = slot_mid(r, c)
@@ -145,12 +146,17 @@ def calib(rows, per, bars, quote=False):
             d[0] += 1; d[1] += y
             pm = min(max(m, 1e-4), 1 - 1e-4)
             bm += (pm - y) ** 2; n += 1
-            spot = mget(per, asset, end - c) or fin
+            # честный якорь: информация СТРОГО до чекпоинта — последняя fully
+            # closed минута и последняя полностью закрытая 5м-палка (иначе
+            # close минуты «заглядывает» на +45..55 с, а volat12 бара — на +300 с)
+            spot = mget(per, asset, end - c - 60) or bench
             d_bps = (spot / bench - 1.0) * 1e4
-            sig = max(0.5, bar_vol(bars, asset, end))          # б.п. на 5м-бар
+            sig = max(0.5, bar_vol(bars, asset, end - c - 301))
             pa = phi(d_bps / (sig * math.sqrt(max(10.0, c) / 300.0)))
             pa = min(max(pa, 1e-4), 1 - 1e-4)
             ba += (pa - y) ** 2
+            dd = byday.setdefault(start // 86400, [0.0, 0.0, 0])
+            dd[0] += (pm - y) ** 2; dd[1] += (pa - y) ** 2; dd[2] += 1
         if not n:
             print(f"  cp={c:>3}: нет данных")
             continue
@@ -162,13 +168,17 @@ def calib(rows, per, bars, quote=False):
             if cnt >= 8:
                 p = (b + 0.5) / 10.0
                 ece += cnt / n * abs(ups / cnt - p)
-        print(f"        ECE {ece*100:.2f} ¢; бакеты (p_mid → realized):")
+        win = sum(1 for eb, ea, nn in byday.values() if nn >= 30 and ea / nn < eb / nn)
+        tot_d = sum(1 for _, _, nn in byday.values() if nn >= 30)
+        print(f"        якорь лучше рынка: {win}/{tot_d} дней (n≥30); "
+              f"ECE {ece*100:.2f} ¢; бакеты (p_mid → realized):")
         line = "        "
         for b in sorted(bins):
             cnt, ups = bins[b]
             line += f"[{(b+0.5)/10:.1f}→{ups/cnt:.2f} n{cnt}] "
         print(line)
-        res[f"cp{c}"] = dict(n=n, brier_m=round(bm/n, 4), brier_a=round(ba/n, 4), ece=round(ece, 4))
+        res[f"cp{c}"] = dict(n=n, brier_m=round(bm/n, 4), brier_a=round(ba/n, 4),
+                             ece=round(ece, 4), anchor_beats_days=f"{win}/{tot_d}")
     return res
 
 
