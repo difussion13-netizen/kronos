@@ -119,11 +119,15 @@ def gamma_map(ids, gamma, batch=8, threads=8):
             for t, v in _mkinfo(mk):
                 m[t] = v
 
+    # закрытые/архивные рынки Gamma по умолчанию НЕ отдаёт ([] на все исторические
+    # окна — проверено 14.09 с расчётной машины), поэтому доклеиваем флаги.
+    gp = "" if "?" in gamma else "&closed=true&archived=true"
+
     def multi(ch):
-        return gamma + "/markets?" + "&".join("clob_token_ids=" + t for t in ch)
+        return gamma + "/markets?" + "&".join("clob_token_ids=" + t for t in ch) + gp
 
     def comma(ch):
-        return gamma + "/markets?clob_token_ids=" + ",".join(ch)
+        return gamma + "/markets?clob_token_ids=" + ",".join(ch) + gp
 
     for name, size, url_of in [("multi", max(1, batch), multi), ("comma", 20, comma),
                                ("comma", 5, comma), ("single", 1, comma)]:
