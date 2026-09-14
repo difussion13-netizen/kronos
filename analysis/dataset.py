@@ -32,8 +32,14 @@ VERSION = "1.0"
 
 
 def collect(a, assets):
-    """Один проход по binance/ и rtds/ за все дни -> {asset: [(ts,px,vol)]}, {asset: [(ts,px,recv)]}."""
-    tb = {x: [] for x in assets}
+    """Один проход по binance/ и rtds/ за все дни.
+
+    Тики НЕ накапливаются — сразу свёртываются в 1-минутные агрегаты
+    {minute: [o,h,l,c,vol,qv,n]}, чтобы память была O(суток), а не O(тики):
+    11 дней x 4 актива = десятки миллионов записей и несколько ГБ RAM.
+    -> ({asset: minute_dict}, {asset: cl_points}, {asset: n_ticks})"""
+    tb = {x: {} for x in assets}
+    tcount = {x: 0 for x in assets}
     clp = {x: [] for x in assets}
     base_of = {K.to_binance_sym(x): x for x in assets}            # btcusdt -> btc
     cl_of = {(x.upper() + "/USD"): x for x in assets}             # BTC/USD  -> btc
@@ -42,6 +48,8 @@ def collect(a, assets):
         for _d, name in K.files_of(a, "binance", [day]):
             for line in K.iter_lines(a.bucket, a.prefix, "binance", day, name):
                 scanned["binance"] += 1
+                if "@aggTrade" not in line:          # depth5/kline не парсим вовсе
+                    continue
                 t, raw = K.parse_rec(line)
                 if not isinstance(raw, dict) or "@" not in str(raw.get("stream", "")):
                     continue
@@ -58,10 +66,25 @@ def collect(a, assets):
                 except Exception:
                     continue
                 if ts > 1e9:
-                    tb[asset].append((ts, px, vol))
+                    m = int(ts // 60) * 60
+                    b = tb[asset].get(m)
+                    if b is None:
+                        tb[asset][m] = [px, px, px, px, vol, px * vol, 1]
+                    else:
+                        if px > b[1]:
+                            b[1] = px
+                        if px < b[2]:
+                            b[2] = px
+                        b[3] = px
+                        b[4] += vol
+                        b[5] += px * vol
+                        b[6] += 1
+                    tcount[asset] += 1
         for _d, name in K.files_of(a, "rtds", [day]):
             for line in K.iter_lines(a.bucket, a.prefix, "rtds", day, name):
                 scanned["rtds"] += 1
+                if "/USD" not in line and "/usd" not in line:
+                    continue
                 t, raw = K.parse_rec(line)
                 if not isinstance(raw, dict):
                     continue
@@ -91,9 +114,8 @@ def collect(a, assets):
                         pass
         print(f"  [{day}] просканировано строк: binance {scanned['binance']:,}, rtds {scanned['rtds']:,}", flush=True)
     for x in assets:
-        tb[x].sort(key=lambda r: r[0])
         clp[x].sort(key=lambda r: r[0])
-    return tb, clp
+    return tb, clp, tcount
 
 
 def minute_bars(trades):
@@ -148,12 +170,11 @@ def std(xs):
     return math.sqrt(sum((x - mu) ** 2 for x in xs) / (n - 1))
 
 
-def build_table(a, asset, trades, cl):
+def build_table(a, asset, m1, ntr, cl):
     fb = 0
-    if len(trades) < 600:
-        print(f"  [{asset}] мало тиков ({len(trades)}) — пропуск")
+    if ntr < 600:
+        print(f"  [{asset}] мало тиков ({ntr}) — пропуск")
         return None
-    m1 = minute_bars(trades)
     bs = rollup(m1, a.tf)
     kmap = {m: (b[0], b[1], b[2], b[3], b[4], b[5], b[6]) for m, b in m1.items()}
     kmin = sorted(kmap)
@@ -200,7 +221,7 @@ def build_table(a, asset, trades, cl):
             row[f"cls_{hm}m"] = cls
         if ok_labels:
             rows.append(row)
-    print(f"  [{asset}] тиков {len(trades)} (ts из приёма {fb}), 1м-баров {len(m1)}, "
+    print(f"  [{asset}] тиков {ntr:,} (ts из приёма {fb}), 1м-баров {len(m1)}, "
           f"{a.tf}-баров {len(bs)}, строк с метками {len(rows)}; CL-точек {len(cl)}")
     return rows
 
@@ -269,9 +290,9 @@ def main():
                         "move_bps_*m": "будущее движение (метка!)",
                         "dir_*m": "1/-1 (метка!)", "cls_*m": "1/0/-1 с порогом flat (метка!)"}}
     assets = [s.strip().lower() for s in a.assets.split(",") if s.strip()]
-    trades_by, cl_by = collect(a, assets)
+    trades_by, cl_by, tcnt = collect(a, assets)
     for asset in assets:
-        rows = build_table(a, asset, trades_by[asset], cl_by[asset])
+        rows = build_table(a, asset, trades_by[asset], tcnt[asset], cl_by[asset])
         if not rows:
             continue
         cols = list(rows[0].keys())
