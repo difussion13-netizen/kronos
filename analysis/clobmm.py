@@ -68,12 +68,14 @@ def load_minutes(win_dir):
     for d in per.values():
         o = sorted(range(len(d["m"])), key=lambda i: d["m"][i])
         d["m"] = [d["m"][i] for i in o]; d["c"] = [d["c"][i] for i in o]
-        dr = [math.log(d["c"][i] / d["c"][i - 1]) * 1e4 for i in range(1, len(o))
-              if d["m"][i] - d["m"][i - 1] <= 120 and d["c"][i - 1] > 0]
-        cs = [0.0]; c2 = [0.0]; s = 0.0; ss = 0.0
-        for v in dr:
-            s += v; ss += v * v; cs.append(s); c2.append(ss)
-        d["dr"], d["cs"], d["c2"] = dr, cs, c2
+        n = len(d["m"])
+        cs = [0.0] * n; c2 = [0.0] * n; vc = [0] * n   # префиксы ПО ПОЗИЦИЯМ m,
+        for i in range(1, n):                            # дырявые минуты не сдвигают
+            cs[i] = cs[i - 1]; c2[i] = c2[i - 1]; vc[i] = vc[i - 1]
+            if d["m"][i] - d["m"][i - 1] <= 120 and d["c"][i - 1] > 0:
+                r = math.log(d["c"][i] / d["c"][i - 1]) * 1e4
+                cs[i] += r; c2[i] += r * r; vc[i] += 1
+        d["cs"], d["c2"], d["vc"] = cs, c2, vc
     return per
 
 
@@ -109,13 +111,14 @@ class Sigma:
 
     def _from_minutes(self, asset, t):
         d = self.per.get(asset)
-        if not d or len(d["dr"]) < 40:
+        if not d or len(d["m"]) < 40:
             return 0.0
-        j = bisect.bisect_right(d["m"], t) - 1     # dr[k] ~ интервал (m[k], m[k+1]]
+        j = bisect.bisect_right(d["m"], t) - 1
         lo = max(0, j - 120)
-        if j - lo < 30:
+        n = d["vc"][j] - d["vc"][lo]
+        if n < 30:
             return 0.0
-        s = d["cs"][j] - d["cs"][lo]; s2 = d["c2"][j] - d["c2"][lo]; n = j - lo
+        s = d["cs"][j] - d["cs"][lo]; s2 = d["c2"][j] - d["c2"][lo]
         return math.sqrt(max(0.0, s2 / n - (s / n) ** 2)) * math.sqrt(5.0)
 
     def get(self, asset, t):
