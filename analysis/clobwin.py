@@ -269,6 +269,31 @@ def do_minutes(a, day, assets):
     print(f"  [{day}/minutes] aggTrade {n:,} -> {out}", flush=True)
 
 
+def _collect_worker(args):
+    bucket, prefix, day = args
+    files = day_files(bucket, prefix, "clob", day)
+    if not files:
+        return day, set()
+    seen = set()
+    for name in files:
+        for ln in iter_lines(bucket, prefix, "clob", day, name):
+            m = RX_ID.search(ln)
+            if m:
+                seen.add(m.group(1).decode())
+    return day, seen
+
+
+def _run_worker(args):
+    bucket, prefix, day, outdir, tokmap, do_minutes, assets = args
+    ns = argparse.Namespace(bucket=bucket, prefix=prefix, outdir=outdir)
+    files = day_files(bucket, prefix, "clob", day)
+    if files:
+        run_day(ns, day, tokmap)
+    if do_minutes:
+        do_minutes(ns, day, set(assets))
+    return day
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bucket", required=True)
@@ -278,6 +303,13 @@ def main():
     ap.add_argument("--outdir", default="/tmp/win")
     ap.add_argument("--gamma", default="https://gamma-api.polymarket.com")
     ap.add_argument("--minutes", action="store_true")
+    ap.add_argument("--jobs", type=int, default=1, help="0=все ядра; параллелизм ПО СУТКАМ")
+    ap.add_argument("--map-only", action="store_true",
+                    help="только passA+gamma: собрать карту токенов и залить в --map-s3 (режим сервера-логгера)")
+    ap.add_argument("--map-s3", default="", help="s3-ключ карты (загрузка/выгрузка), напр. kronos/tokens_map.json")
+    ap.add_argument("--rescan", action="store_true", help="принудительно собрать ids заново, даже если карта есть")
+    ap.add_argument("--map-fill", action="store_true",
+                    help="режим сервера-логгера: скачать ids_unmapped из S3, спросить Gamma, залить карту")
     ap.add_argument("--assets", default="btc,eth,sol,xrp")
     a = ap.parse_args()
     days = []
@@ -293,23 +325,86 @@ def main():
             days = a.days.split(",")
     os.makedirs(a.outdir, exist_ok=True)
     map_path = os.path.join(a.outdir, "tokens_map.json")
-    tokmap = json.load(open(map_path)) if os.path.exists(map_path) else {}
-    if tokmap:
-        print(f"карта токенов: {len(tokmap)} из кэша")
-    for day in days:
-        files = day_files(a.bucket, a.prefix, "clob", day)
-        if not files:
-            print(f"  [{day}] нет clob-файлов — пропуск")
-            continue
-        ids = collect_ids(a, day, files)
-        new_ids = [x for x in ids if x not in tokmap]
-        if new_ids:                       # карта пополняется приростом (окна меняются ежедневно)
-            tokmap.update(gamma_map(new_ids, a.gamma))
+    if a.map_s3 and (not os.path.exists(map_path) or a.rescan):
+        subprocess.run(f"aws s3 cp s3://{a.bucket}/{a.map_s3} {map_path}", shell=True,
+                       capture_output=True)
+    tokmap = {}
+    if os.path.exists(map_path) and not a.rescan:
+        try:
+            tokmap = json.load(open(map_path))
+            print(f"карта токенов: {len(tokmap)} (файл)")
+        except Exception:
+            tokmap = {}
+    jobs = a.jobs or (os.cpu_count() or 2)
+
+    if a.map_only:                        # режим сервера-логгера: карта -> S3
+        import multiprocessing as mp
+        with mp.Pool(min(jobs, max(1, len(days)))) as pool:
+            seen = set()
+            for day, ids in pool.imap_unordered(_collect_worker,
+                                                 [(a.bucket, a.prefix, d) for d in days]):
+                print(f"  [{day}/passA] токенов {len(ids)}", flush=True)
+                seen |= ids
+        fresh = [x for x in seen if x not in tokmap]
+        if fresh:
+            tokmap.update(gamma_map(fresh, a.gamma))
+        json.dump(tokmap, open(map_path, "w"))
+        print(f"карта: {len(tokmap)} токенов")
+        if a.map_s3:
+            subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
+            print("карта залита в s3://" + a.bucket + "/" + a.map_s3)
+        return
+
+    if a.map_fill:                        # лёгкая роль: только Gamma по чужому списку ids
+        ids_path = map_path + ".ids"
+        if a.map_s3:
+            subprocess.run(f"aws s3 cp s3://{a.bucket}/{a.map_s3}.ids {ids_path}",
+                           shell=True, capture_output=True)
+        ids = [x.strip() for x in open(ids_path)] if os.path.exists(ids_path) else []
+        if not ids:
+            raise SystemExit("нет ids_unmapped — сначала запуска clobwin на расчётной машине")
+        fresh = [x for x in ids if x not in tokmap]
+        tokmap.update(gamma_map(fresh, a.gamma))
+        json.dump(tokmap, open(map_path, "w"))
+        if a.map_s3:
+            subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
+        print(f"готово: карта {len(tokmap)} токенов залита в S3")
+        return
+
+    need_ids = [d for d in days if not tokmap]
+    if need_ids:
+        import multiprocessing as mp
+        with mp.Pool(min(jobs, len(need_ids))) as pool:
+            seen = set()
+            for day, ids in pool.imap_unordered(_collect_worker,
+                                                 [(a.bucket, a.prefix, d) for d in need_ids]):
+                print(f"  [{day}/passA] токенов {len(ids)}", flush=True)
+                seen |= ids
+        fresh = [x for x in seen if x not in tokmap]
+        if fresh:
+            tokmap.update(gamma_map(fresh, a.gamma))
             json.dump(tokmap, open(map_path, "w"))
-            print(f"  карта: +{len(new_ids)} новых, всего {len(tokmap)}")
-        run_day(a, day, tokmap)
-        if a.minutes:
-            do_minutes(a, day, set(x.strip().lower() for x in a.assets.split(",")))
+            if a.map_s3:
+                subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
+            print(f"  карта обновлена: {len(tokmap)}")
+        if fresh and not tokmap:          # Gamma не отдаёт ничего —relay-сценарий
+            idsp = map_path + ".ids"
+            open(idsp, "w").write("\n".join(sorted(fresh)))
+            if a.map_s3:
+                subprocess.run(f"aws s3 cp {idsp} s3://{a.bucket}/{a.map_s3}.ids", shell=True)
+                print(f"ids залиты в s3://{a.bucket}/{a.map_s3}.ids")
+            raise SystemExit(
+                "\nGamma недоступна с этого IP. Релей: на сервере-логгере выполни\n"
+                f"  python3 clobwin.py --bucket {a.bucket} --outdir {a.outdir} "
+                f"--map-fill --map-s3 {a.map_s3 or 'kronos/tokens_map.json'}\n"
+                "и повтори эту команду — карта подтянется из S3.")
+    assets = set(x.strip().lower() for x in a.assets.split(","))
+    work = [(a.bucket, a.prefix, d, a.outdir, tokmap, a.minutes, assets) for d in days
+            if day_files(a.bucket, a.prefix, "clob", d)]
+    import multiprocessing as mp
+    with mp.Pool(min(jobs, max(1, len(work)))) as pool:
+        for day in pool.imap_unordered(_run_worker, work):
+            print(f"  [{day}] passC завершён", flush=True)
     print("готово:", a.outdir)
 
 
