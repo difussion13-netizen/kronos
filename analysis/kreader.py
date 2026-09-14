@@ -376,6 +376,23 @@ def cmd_lag(a):
         print("одного из рядов нет — пришли вывод этой шапки (я допишу матчинг под реальные имена)")
         return
     lo, hi = max(bn[0][0], cl[0][0]), min(bn[-1][0], cl[-1][0])
+    # дедуп по ts события: переподключения RTDS при подписке отдают «историю
+    # последних минут» повторно — без схлопывания счётчики и статистика врут
+    uniq = {}
+    for ts, px, rts in cl:
+        prev = uniq.get(ts)
+        if prev is None or (rts or 0) >= (prev[2] or 0):
+            uniq[ts] = (ts, px, rts)
+    dup = len(cl) - len(uniq)
+    cl = sorted(uniq.values(), key=lambda x: x[0])
+    if dup:
+        print(f"  дедуп: {len(cl)} уникальных точек ({dup} дубликатов из снапшотов реконнектов отброшено)")
+    lo2, hi2 = max(bn[0][0], cl[0][0]), min(bn[-1][0], cl[-1][0])
+    cov = (hi2 - lo2) / max(1.0, hi - lo)
+    if cov < 0.5:
+        print(f"  внимание: уникальные CL-точки покрывают только {cov:.0%} окна "
+              f"({(lo2-lo)/60:.0f}м пропущено в начале) — прикидывай статистику на реальном пересечении")
+    lo, hi = lo2, hi2
     cl = [x for x in cl if lo <= x[0] <= hi]
     bn = [x for x in bn if lo - 5 <= x[0] <= hi + 5]
     print(f"общее окно: {(hi - lo)/60:.0f} мин\n")
