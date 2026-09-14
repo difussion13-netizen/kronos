@@ -397,20 +397,96 @@ class BinanceStream(Stream):
 # ---------------------------------------------------------------- clob
 
 class ClobStream(Stream):
-    """Динамическая подписка: каждые discover_every_s пересчитываем активные окна
-    через Gamma (детерминированные слаги btc-updown-5m-<epoch> и fallback-запрос
-    по series), шлём новый subscribe; на смене часа окна форсируем reconnect."""
+    """4 соединения — по одному на актив. Единый сокет на 56-72 токена переливает
+    биржевой per-connection буфер: Polymarket пинает 1013 slow consumer каждые
+    ~45 с (наблюдение 2026-09-14, даже без fsync в loop). Дробим подписку сами:
+    лимит считается на соединение. Discovery общий (slot_cache на всё семейство),
+    subscribe/dynamic/reconnect — per-asset."""
 
     def __init__(self, name, cfg, writer, meta_writer):
         c = cfg["streams"]["clob"]
         self.cfgc = c
         self.meta = meta_writer
-        self.sub_ids: set[str] = set()   # реально отправленные бирже id
+        self._assets = list(c.get("assets", ["btc"]))
+        self.ws_by: dict[str, object] = {}                    # asset -> живой ws
+        self.sub_ids = {a: set() for a in self._assets}
+        self._last_disc = {a: 0.0 for a in self._assets}
         self.slot_cache: dict = {}       # (asset, code, sec, slot) -> ids/() ; () = повторить
-        self.ws = None
         self._sub_tmpl = dict(c.get("subscribe_template",
                                     {"auth": {}, "type": "MARKET", "assets_ids": []}))
         super().__init__(name, cfg, writer, c["url"], idle_timeout=1800.0)
+
+    # -- supervisor: один раннер на актив --------------------------------------
+    async def run(self, stop: asyncio.Event):
+        async with asyncio.TaskGroup() as tg:
+            for a in self._assets:
+                tg.create_task(self._run_conn(a, stop))
+
+    async def _run_conn(self, asset: str, stop: asyncio.Event):
+        import websockets
+        name = f"{self.name}:{asset}"
+        backoff = 0.5
+        while not stop.is_set():
+            try:
+                kwargs = dict(max_size=None, max_queue=4096, close_timeout=5,
+                              ping_interval=self.ping_interval,
+                              ping_timeout=self.ping_interval or None)
+                async with websockets.connect(self.url, **kwargs) as ws:
+                    backoff = 0.5
+                    STATS.touch(self.name, "reconnects")
+                    self.ws_by[asset] = ws
+                    await self.on_connected(ws, asset)
+                    await self._pump_conn(ws, stop, asset, name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                STATS.err(self.name)
+                log.warning("[%s] %s: %s", name, type(e).__name__, e)
+            finally:
+                if self.ws_by.get(asset) is not None:
+                    self.ws_by.pop(asset, None)
+            if stop.is_set():
+                break
+            await asyncio.sleep(min(30.0, backoff) * (1 + random.random() * 0.4))
+            backoff = min(30.0, backoff * 2)
+
+    async def _pump_conn(self, ws, stop: asyncio.Event, asset: str, name: str):
+        last = time.monotonic()
+
+        async def watchdog():
+            while not stop.is_set():
+                await asyncio.sleep(10)
+                if time.monotonic() - last > self.idle_timeout:
+                    log.warning("[%s] idle %.0fs -> reconnect", name,
+                                time.monotonic() - last)
+                    await ws.close()
+                    return
+
+        async def refresher():
+            while not stop.is_set():
+                await asyncio.sleep(10)
+                try:
+                    if await self.dynamic(asset):
+                        await ws.close()
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.warning("[%s] dynamic: %s", name, e)
+
+        tasks = [asyncio.create_task(watchdog()), asyncio.create_task(refresher())]
+        try:
+            async for msg in ws:
+                last = time.monotonic()
+                if isinstance(msg, bytes):
+                    msg = msg.decode("utf-8", "replace")
+                if msg == "PONG":
+                    continue
+                STATS.touch(self.name)
+                self.writer.write_raw(msg)
+        finally:
+            for t in tasks:
+                t.cancel()
 
     # -- discovery (sync HTTP, из executor'а) ---------------------------------
     def _http_json(self, url: str):
@@ -434,80 +510,78 @@ class ClobStream(Stream):
             ids.extend(str(t) for t in toks)
         return ids
 
-    def discover(self) -> tuple[tuple[str, ...], list[dict]]:
-        """Опрос Gamma ПО СЛОТАМ с кэшем. Пустой/ошибшийся слот переопрашивается,
-        пока его окно не истекло: сбой 422/таймаут на одном slug больше не стоит
-        суток серии (именно так потеряли 15m 2026-09-14)."""
+    def discover(self, asset: str) -> tuple[tuple[str, ...], list[dict]]:
+        """Опрос Gamma ПО СЛОТАМ кэша одного актива. Пустой/ошибшийся слот
+        переопрашивается, пока окно не истекло (урок 15m-дня 2026-09-14)."""
         now = time.time()
         look = self.cfgc.get("lookahead_s", 900)
         gamma = self.cfgc.get("gamma", "https://gamma-api.polymarket.com")
         meta: list[dict] = []
-        for asset in self.cfgc.get("assets", ["btc"]):
-            for iv in self.cfgc.get("intervals", [{"code": "5m", "seconds": 300}]):
-                sec = int(iv["seconds"])
-                for slot in range(int(now // sec), int((now + look) // sec) + 1):
-                    key = (asset, iv["code"], sec, slot)
-                    if self.slot_cache.get(key):
-                        continue                                   # получено
-                    if key in self.slot_cache and now > slot * sec + sec + 600:
-                        continue                                   # поздно, окно мертво
-                    slug = f"{asset}-updown-{iv['code']}-{slot * sec}"
-                    try:
-                        events = self._http_json(
-                            f"{gamma}/events?" + urllib.parse.urlencode({"slug": slug}))
-                    except Exception as e:
-                        log.warning("[clob] gamma %s: %s (повтор)", slug, e)
-                        self.slot_cache[key] = ()
-                        continue
-                    got: set[str] = set()
-                    for ev in events or []:
-                        got.update(self._parse_event(ev, now - 10 ** 9, now + 10 ** 9))
-                    self.slot_cache[key] = tuple(sorted(got))
-                    if got:
-                        meta.append({"slug": slug, "n_tokens": len(got)})
+        for iv in self.cfgc.get("intervals", [{"code": "5m", "seconds": 300}]):
+            sec = int(iv["seconds"])
+            for slot in range(int(now // sec), int((now + look) // sec) + 1):
+                key = (asset, iv["code"], sec, slot)
+                if self.slot_cache.get(key):
+                    continue                                   # получено
+                if key in self.slot_cache and now > slot * sec + sec + 600:
+                    continue                                   # поздно, окно мертво
+                slug = f"{asset}-updown-{iv['code']}-{slot * sec}"
+                try:
+                    events = self._http_json(
+                        f"{gamma}/events?" + urllib.parse.urlencode({"slug": slug}))
+                except Exception as e:
+                    log.warning("[clob:%s] gamma %s: %s (повтор)", asset, slug, e)
+                    self.slot_cache[key] = ()
+                    continue
+                got: set[str] = set()
+                for ev in events or []:
+                    got.update(self._parse_event(ev, now - 10 ** 9, now + 10 ** 9))
+                self.slot_cache[key] = tuple(sorted(got))
+                if got:
+                    meta.append({"slug": slug, "n_tokens": len(got)})
         ids: set[str] = set()
         for key in list(self.slot_cache):
             a, code, sec, slot = key
             if slot * sec + sec < now - 120:
-                del self.slot_cache[key]                           # из оборота
+                del self.slot_cache[key]                       # из оборота
                 continue
-            ids.update(self.slot_cache[key])
+            if a == asset:
+                ids.update(self.slot_cache[key])
         return tuple(sorted(ids)), meta
 
-    async def _discover_async(self):
-        return await asyncio.get_running_loop().run_in_executor(None, self.discover)
+    async def _discover_async(self, asset: str):
+        return await asyncio.get_running_loop().run_in_executor(None, self.discover, asset)
 
-    async def on_connected(self, ws):
-        self.ws = ws
-        self.sub_ids = set()
-        ids, meta = await self._discover_async()
+    async def on_connected(self, ws, asset: str):
+        ids, meta = await self._discover_async(asset)
         await ws.send(json.dumps({**self._sub_tmpl, "assets_ids": list(ids)}))
-        self.sub_ids = set(ids)
+        self.sub_ids[asset] = set(ids)
         for ev in meta:
             self.meta.write_raw(json.dumps({"ev": "subscribe", **ev}))
-        log.info("[clob] subscribed %d tokens", len(ids))
-        self._last_disc = time.monotonic()
+        log.info("[clob:%s] subscribed %d tokens", asset, len(ids))
+        self._last_disc[asset] = time.monotonic()
 
-    async def dynamic(self):
-        """Пересчёт активных окон. Newly discovered id доподписываются в живой
-        сокет АДДИТИВНО — без reconnect: мёртвые окна молчат сами, надёжного
-        unsubscribe нет, а reconnect каждые 45 с рвал снапшоты (шторм 14.09)."""
+    async def dynamic(self, asset: str):
+        """Новые id актива доподписываются АДДИТИВНО в его сокет; reconnect — только
+        при реальной ошибке сокета (шторм переподписки 14.09 больше не нужен)."""
         refresh = self.cfgc.get("discover_every_s", 45)
-        if time.monotonic() - getattr(self, "_last_disc", 0) < refresh:
+        if time.monotonic() - self._last_disc[asset] < refresh:
             return False
-        self._last_disc = time.monotonic()
-        ids, meta = await self._discover_async()
+        self._last_disc[asset] = time.monotonic()
+        ws = self.ws_by.get(asset)
+        ids, meta = await self._discover_async(asset)
         for ev in meta:
             self.meta.write_raw(json.dumps({"ev": "discover", **ev}))
-        new_ids = [t for t in ids if t not in self.sub_ids]
-        if not new_ids or self.ws is None:
+        new_ids = [t for t in ids if t not in self.sub_ids[asset]]
+        if not new_ids or ws is None:
             return False
         try:
-            await self.ws.send(json.dumps({**self._sub_tmpl, "assets_ids": new_ids}))
+            await ws.send(json.dumps({**self._sub_tmpl, "assets_ids": new_ids}))
         except Exception:
             return True                       # сокет сдох — обычный путь reconnect
-        self.sub_ids.update(new_ids)
-        log.info("[clob] +%d ids (total %d) — аддитивно", len(new_ids), len(self.sub_ids))
+        self.sub_ids[asset].update(new_ids)
+        log.info("[clob:%s] +%d ids (total %d) — аддитивно",
+                 asset, len(new_ids), len(self.sub_ids[asset]))
         return False
 
 
