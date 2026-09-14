@@ -398,8 +398,11 @@ class ClobStream(Stream):
         c = cfg["streams"]["clob"]
         self.cfgc = c
         self.meta = meta_writer
-        self.cur_ids: tuple[str, ...] = ()
-        self.last_discover = 0.0
+        self.sub_ids: set[str] = set()   # реально отправленные бирже id
+        self.slot_cache: dict = {}       # (asset, code, sec, slot) -> ids/() ; () = повторить
+        self.ws = None
+        self._sub_tmpl = dict(c.get("subscribe_template",
+                                    {"auth": {}, "type": "MARKET", "assets_ids": []}))
         super().__init__(name, cfg, writer, c["url"], idle_timeout=1800.0)
 
     # -- discovery (sync HTTP, из executor'а) ---------------------------------
@@ -425,64 +428,79 @@ class ClobStream(Stream):
         return ids
 
     def discover(self) -> tuple[tuple[str, ...], list[dict]]:
+        """Опрос Gamma ПО СЛОТАМ с кэшем. Пустой/ошибшийся слот переопрашивается,
+        пока его окно не истекло: сбой 422/таймаут на одном slug больше не стоит
+        суток серии (именно так потеряли 15m 2026-09-14)."""
         now = time.time()
         look = self.cfgc.get("lookahead_s", 900)
         gamma = self.cfgc.get("gamma", "https://gamma-api.polymarket.com")
-        out: set[str] = set()
         meta: list[dict] = []
         for asset in self.cfgc.get("assets", ["btc"]):
             for iv in self.cfgc.get("intervals", [{"code": "5m", "seconds": 300}]):
                 sec = int(iv["seconds"])
-                slots = {int(now // sec), int((now + look) // sec)}
-                for slot in sorted(slots):
+                for slot in range(int(now // sec), int((now + look) // sec) + 1):
+                    key = (asset, iv["code"], sec, slot)
+                    if self.slot_cache.get(key):
+                        continue                                   # получено
+                    if key in self.slot_cache and now > slot * sec + sec + 600:
+                        continue                                   # поздно, окно мертво
                     slug = f"{asset}-updown-{iv['code']}-{slot * sec}"
                     try:
                         events = self._http_json(
                             f"{gamma}/events?" + urllib.parse.urlencode({"slug": slug}))
                     except Exception as e:
-                        log.debug("gamma %s: %s", slug, e)
+                        log.warning("[clob] gamma %s: %s (повтор)", slug, e)
+                        self.slot_cache[key] = ()
                         continue
-                    if not events:
-                        continue
-                    for ev in events:
-                        got = self._parse_event(ev, now - sec, now + look)
-                        if got:
-                            out.update(got)
-                            meta.append({"slug": slug, "n_tokens": len(got)})
-        return tuple(sorted(out)), meta
+                    got: set[str] = set()
+                    for ev in events or []:
+                        got.update(self._parse_event(ev, now - 10 ** 9, now + 10 ** 9))
+                    self.slot_cache[key] = tuple(sorted(got))
+                    if got:
+                        meta.append({"slug": slug, "n_tokens": len(got)})
+        ids: set[str] = set()
+        for key in list(self.slot_cache):
+            a, code, sec, slot = key
+            if slot * sec + sec < now - 120:
+                del self.slot_cache[key]                           # из оборота
+                continue
+            ids.update(self.slot_cache[key])
+        return tuple(sorted(ids)), meta
 
     async def _discover_async(self):
         return await asyncio.get_running_loop().run_in_executor(None, self.discover)
 
     async def on_connected(self, ws):
+        self.ws = ws
+        self.sub_ids = set()
         ids, meta = await self._discover_async()
-        self.cur_ids = ids
-        tmpl = dict(self.cfgc.get("subscribe_template",
-                                  {"auth": {}, "type": "MARKET", "assets_ids": []}))
-        await ws.send(json.dumps({**tmpl, "assets_ids": list(ids)}))
+        await ws.send(json.dumps({**self._sub_tmpl, "assets_ids": list(ids)}))
+        self.sub_ids = set(ids)
         for ev in meta:
             self.meta.write_raw(json.dumps({"ev": "subscribe", **ev}))
         log.info("[clob] subscribed %d tokens", len(ids))
         self._last_disc = time.monotonic()
 
     async def dynamic(self):
-        """Пересчёт активных окон. Любое изменение набора id -> reconnect с чистой
-        подпиской (CLOB WS не поддерживает надёжный unsubscribe)."""
+        """Пересчёт активных окон. Newly discovered id доподписываются в живой
+        сокет АДДИТИВНО — без reconnect: мёртвые окна молчат сами, надёжного
+        unsubscribe нет, а reconnect каждые 45 с рвал снапшоты (шторм 14.09)."""
         refresh = self.cfgc.get("discover_every_s", 45)
         if time.monotonic() - getattr(self, "_last_disc", 0) < refresh:
             return False
         self._last_disc = time.monotonic()
         ids, meta = await self._discover_async()
         for ev in meta:
-            self.meta.write_raw(json.dumps({"ev": "discover", "n_tokens": len(ids), **ev}))
-        if not ids:
-            return False  # discovery лёг — не трогаем живую подписку
-        if ids != self.cur_ids:
-            added, removed = set(ids) - set(self.cur_ids), set(self.cur_ids) - set(ids)
-            log.info("[clob] ids +%d -%d (total %d) -> reconnect",
-                     len(added), len(removed), len(ids))
-            self.cur_ids = ids
-            return True
+            self.meta.write_raw(json.dumps({"ev": "discover", **ev}))
+        new_ids = [t for t in ids if t not in self.sub_ids]
+        if not new_ids or self.ws is None:
+            return False
+        try:
+            await self.ws.send(json.dumps({**self._sub_tmpl, "assets_ids": new_ids}))
+        except Exception:
+            return True                       # сокет сдох — обычный путь reconnect
+        self.sub_ids.update(new_ids)
+        log.info("[clob] +%d ids (total %d) — аддитивно", len(new_ids), len(self.sub_ids))
         return False
 
 
