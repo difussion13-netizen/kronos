@@ -425,11 +425,22 @@ def main():
     if a.map_s3 and (not os.path.exists(map_path) or a.rescan):
         subprocess.run(f"aws s3 cp s3://{a.bucket}/{a.map_s3} {map_path}", shell=True,
                        capture_output=True)
+    cov_path = os.path.join(a.outdir, "map_covered.json")
+    if a.map_s3 and not os.path.exists(cov_path):
+        subprocess.run(f"aws s3 cp s3://{a.bucket}/{a.map_s3}.days {cov_path}",
+                       shell=True, capture_output=True)
+    covered = set()
+    if os.path.exists(cov_path) and not a.rescan:
+        try:
+            covered = set(json.load(open(cov_path)))
+        except Exception:
+            covered = set()
     tokmap = {}
     if os.path.exists(map_path) and not a.rescan:
         try:
             tokmap = json.load(open(map_path))
-            print(f"карта токенов: {len(tokmap)} (файл)")
+            print(f"карта токенов: {len(tokmap)} (файл), покрытые сутки: "
+                  f"{sorted(covered)[:3]}…{sorted(covered)[-2:] if len(covered) > 2 else ''}")
         except Exception:
             tokmap = {}
     jobs = a.jobs or (os.cpu_count() or 2)
@@ -471,7 +482,7 @@ def main():
         print(f"готово: карта {len(tokmap)} токенов залита в S3")
         return
 
-    need_ids = [d for d in days if not tokmap]
+    need_ids = [d for d in days if not tokmap or d not in covered]
     if need_ids:
         import multiprocessing as mp
         with mp.Pool(min(jobs, len(need_ids))) as pool:
@@ -488,7 +499,7 @@ def main():
             if a.map_s3:
                 subprocess.run(f"aws s3 cp {map_path} s3://{a.bucket}/{a.map_s3}", shell=True)
             print(f"  карта обновлена: {len(tokmap)}")
-        if fresh and not tokmap:          # Gamma не отдаёт ничего —relay-сценарий
+        if fresh and not tokmap:          # Gamma не отдаёт ничего — relay-сценарий
             idsp = map_path + ".ids"
             open(idsp, "w").write("\n".join(sorted(fresh)))
             if a.map_s3:
@@ -499,6 +510,16 @@ def main():
                 f"  python3 clobwin.py --bucket {a.bucket} --outdir {a.outdir} "
                 f"--map-fill --map-s3 {a.map_s3 or 'kronos/tokens_map.json'}\n"
                 "и повтори эту команду — карта подтянется из S3.")
+        # отмечаем покрытие: сутки, где ids найдены и доспрошены, — готовы;
+        # пустые (логгер ещё не дописал) НЕ помечаем — переснимутся позже
+        for d in need_ids:
+            idf = os.path.join(a.outdir, f"ids_{d}.txt")
+            if os.path.exists(idf) and os.path.getsize(idf) > 0:
+                covered.add(d)
+        json.dump(sorted(covered), open(cov_path, "w"))
+        if a.map_s3:
+            subprocess.run(f"aws s3 cp {cov_path} s3://{a.bucket}/{a.map_s3}.days",
+                           shell=True, capture_output=True)
     assets = set(x.strip().lower() for x in a.assets.split(","))
     work = [(a.bucket, a.prefix, d, a.outdir, tokmap, a.minutes, assets) for d in days
             if day_files(a.bucket, a.prefix, "clob", d)]
