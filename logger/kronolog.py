@@ -417,10 +417,17 @@ class ClobStream(Stream):
         super().__init__(name, cfg, writer, c["url"], idle_timeout=1800.0)
 
     # -- supervisor: один раннер на актив --------------------------------------
+    # ВАЖНО: без TaskGroup — на venv логгера (<3.11) это AttributeError, и
+    # процесс входил в краш-цикл (пустой status.json 14.09 20:23+).
     async def run(self, stop: asyncio.Event):
-        async with asyncio.TaskGroup() as tg:
-            for a in self._assets:
-                tg.create_task(self._run_conn(a, stop))
+        tasks = [asyncio.create_task(self._run_conn(a, stop), name=f"clob-{a}")
+                 for a in self._assets]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
 
     async def _run_conn(self, asset: str, stop: asyncio.Event):
         import websockets
