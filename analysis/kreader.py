@@ -35,7 +35,7 @@ import sys
 import urllib.request
 from collections import Counter, defaultdict
 
-STREAMS = ("clob", "binance", "rtds", "meta")
+STREAMS = ("clob", "binance", "rtds")   # meta пишется в clob_meta/ с другим именованием — вне сетки
 _BN_MAP = {"btc/usd": "btcusdt", "eth/usd": "ethusdt", "sol/usd": "solusdt", "xrp/usd": "xrpusdt"}
 
 
@@ -530,7 +530,10 @@ def cmd_verify(a):
     bn_s, _fb = load_binance_series(a, [vday], sym)
     bn = [(ts, px) for ts, px, _ in bn_s]
     ours = dict((int(ts // 60) * 60, v) for ts, v in bn)
-    diffs = []
+    ours_close = {}
+    for ts, v in bn:                      # ряд отсортирован — последняя тик-цена минуты и есть close
+        ours_close[int(ts // 60) * 60] = v
+    diffs, dcl = [], []
     n = 0
     for row in kl:
         k = int(row[0] // 1000 // 60 * 60)
@@ -538,6 +541,9 @@ def cmd_verify(a):
         if k in ours:
             diffs.append(abs(ours[k] - mid_theirs) / mid_theirs * 1e4)
             n += 1
+        cl = float(row[4])
+        if k in ours_close and cl:
+            dcl.append(abs(ours_close[k] - cl) / cl * 1e4)
     print(f"# verify {sym}: сверил {n} минутных слотов (наш mid vs (high+low)/2 klines)")
     if diffs:
         diffs.sort()
@@ -545,6 +551,12 @@ def cmd_verify(a):
               f"макс {diffs[-1]:.1f} б.п.")
         print("(mid-книги и high/low — разные величины; важны хвосты: если p90 единичные б.п. — "
               "наши тики покрывают Binance полностью)")
+    if dcl:
+        dcl.sort()
+        print(f"close-vs-close (последний наш тик vs официальный close): медиана "
+              f"{statistics.median(dcl):.2f} б.п., p90 {q(dcl,0.9):.2f}, макс {dcl[-1]:.2f} "
+              f"(за {len(dcl)} мин) — при полном совпадении ≈0; медиана >2 б.п. = тики "
+              f"опоздывают/теряются")
     else:
         print("нет пересечения по времени — выбери --day, где точно есть данные, и уменьши шум: "
               "klines берутся за последние минуты, а логи уходят в S3 ротацией 15м")
