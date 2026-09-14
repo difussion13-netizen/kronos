@@ -110,6 +110,7 @@ class PartWriter:
         self._path = path
         self._fh = gzip.open(path, "wb", compresslevel=1)
         self._plines = 0
+        self._pbytes = 0
         self._rot_at = time.monotonic() + self.rotate_s
 
     def _close_part(self):
@@ -125,27 +126,33 @@ class PartWriter:
         self._pending.put_nowait(self._path)
 
     def _flush_buf(self):
+        # без flush()/fsync(): gzip.GzipFile буферит сам; fsync каждые 4096 строк
+        # вешал event loop на десятки мс -> WS-ридер не успевал -> биржа пинала
+        # 1013 slow consumer. Надёжность даёт закрытие части + выгрузка, не fsync.
         if not self._buf or self._fh is None:
             return
         data = ("\n".join(self._buf) + "\n").encode()
         self._buf.clear()
+        self._pbytes = 0
         self._fh.write(data)
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
         self.n_bytes += len(data)
 
     def write_raw(self, raw: str):
-        try:
-            parsed = json.loads(raw)
-            line = json.dumps({"t": time.time_ns(), "raw": parsed}, separators=(",", ":"))
-        except Exception:
+        # конверт {"t":...,"raw":<оригинал>} собирается СТРОКОЙ: WS-JSOM от биржи
+        # компактный и без переводов строк — повторный json.loads/dumps на каждое сообщение
+        # стоил 20% CPU и был вторым источником 1013. Если текст нестандартный —
+        # старый безопасный путь.
+        if raw[:1] in "{[" and "\n" not in raw:
+            line = '{"t":%d,"raw":%s}' % (time.time_ns(), raw)
+        else:
             line = json.dumps({"t": time.time_ns(), "text": raw[:65536]}, separators=(",", ":"))
         if self._fh is None:
             self._open_part()
         self._buf.append(line)
         self.n_lines += 1
         self._plines = getattr(self, "_plines", 0) + 1
-        if len(self._buf) >= 4096:
+        self._pbytes = getattr(self, "_pbytes", 0) + len(line) + 1
+        if self._pbytes >= 6_000_000:
             self._flush_buf()
             if self._fh.tell() >= self.max_bytes:
                 self._close_part()
