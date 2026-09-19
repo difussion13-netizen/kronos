@@ -440,7 +440,7 @@ def main():
 
     # Feature importance (weights)
     print(f"\n=== Feature weights ===")
-    wf = sorted(zip(feat_names, w), key=lambda x: -abs(x[1]))
+    wf = sorted(zip(feat_names, w_model), key=lambda x: -abs(x[1]))
     for name, weight in wf:
         bar = "█" * int(20 * abs(weight) / (max(abs(ww) for _, ww in wf) or 1))
         sign = "+" if weight > 0 else "-"
