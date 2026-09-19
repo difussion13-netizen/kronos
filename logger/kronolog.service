@@ -1,0 +1,20 @@
+[Unit]
+Description=kronolog - Polymarket/Binance WS data logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=kronolog
+WorkingDirectory=/opt/kronolog/app
+ExecStart=/opt/kronolog/venv/bin/python /opt/kronolog/app/kronolog.py --config /opt/kronolog/app/config.yaml
+Restart=always
+RestartSec=4
+MemoryMax=1200M
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kronolog
+
+[Install]
+WantedBy=multi-user.target
