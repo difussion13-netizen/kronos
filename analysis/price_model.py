@@ -429,7 +429,122 @@ def main():
         print(f"  КРАСНЫЙ: Gaussian лучше или равен ({brier_improvement:+.4f})")
         print(f"  → параметрическая Φ(optimal на этих данных")
 
-    os.makedirs(a.outdir, exist_ok=True)
+    # -----------------------------------------------------------------------
+    # MM-сравнение: Gaussian center vs Learned center
+    # -----------------------------------------------------------------------
+    print(f"\n=== MM-сравнение: Gaussian vs Learned (test, k=2.5, f=0.5¢) ===")
+    k = 2.5
+    f_margin = 0.5
+
+    def phi(x):
+        """PDF стандартного нормального распределения."""
+        return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+    def mm_simulate(feats, centers, venue, windows_by_key, k, f_margin):
+        """Простой MM-сим: markout для одного центра.
+        Возвращает: {fills, pairs, pnl, markouts, дни+}.
+        """
+        fills = []
+        for i, feat in enumerate(feats):
+            center = centers[i]
+            # σ_p = √(P·(1−P)) для полуширины
+            p = max(0.01, min(0.99, center))
+            sigma_p = math.sqrt(p * (1 - p))
+            half_width = k * sigma_p * math.sqrt(1.0 / 5.0)  # step/τ = 60/300
+
+            bid = max(0.005, center - half_width)
+            ask = min(0.995, center + half_width)
+
+            # Ищем venue label для этого окна
+            # (feat и windows_by_key синхронизированы по индексу)
+            # Пропускаем — markout считаем отдельно
+            fills.append({
+                "center": center,
+                "bid": bid,
+                "ask": ask,
+                "half_width": half_width,
+            })
+        return fills
+
+    # Считаем σ_p и half_width для каждого центра
+    gauss_centers = gauss_te
+    model_centers = pred_te
+
+    gauss_hw, model_hw = [], []
+    for i in range(len(test_feats)):
+        pg = max(0.01, min(0.99, gauss_centers[i]))
+        pm = max(0.01, min(0.99, model_centers[i]))
+        hw_g = k * math.sqrt(pg * (1 - pg)) * math.sqrt(1.0 / 5.0)
+        hw_m = k * math.sqrt(pm * (1 - pm)) * math.sqrt(1.0 / 5.0)
+        gauss_hw.append(hw_g)
+        model_hw.append(hw_m)
+
+    avg_gauss_hw = sum(gauss_hw) / len(gauss_hw)
+    avg_model_hw = sum(model_hw) / len(model_hw)
+    hw_improvement = avg_gauss_hw - avg_model_hw
+
+    print(f"  Gaussian avg half-width: {avg_gauss_hw:.4f} ({avg_gauss_hw*100:.2f}¢)")
+    print(f"  Learned avg half-width:  {avg_model_hw:.4f} ({avg_model_hw*100:.2f}¢)")
+    print(f"  Сужение спреда:          {hw_improvement:.4f} ({hw_improvement*100:+.2f}¢)")
+    print(f"  Сужение спреда (%):      {hw_improvement/avg_gauss_hw*100:+.1f}%")
+
+    # Markout-симуляция: fill при касании, markout = (y − px)·100
+    # Для каждого окна: если market mid пересёк наш bid → fill BUY по bid
+    # markout = (y − bid)·100 (y=1 → +выигрыш, y=0 → −проигрыш)
+    print(f"\n  Markout-симуляция (fill при касании bid, markout = (y − bid)·100):")
+    for label, centers, hw_list in [("Gaussian", gauss_centers, gauss_hw),
+                                     ("Learned", model_centers, model_hw)]:
+        markouts = []
+        for i in range(len(test_feats)):
+            y = test_y[i]
+            center = centers[i]
+            hw = hw_list[i]
+            bid = max(0.005, center - hw)
+            # Простая модель: fill если center < 0.5 (рынок дешёвый)
+            # markout = (y − bid)·100
+            # Это верхняя граница — реальный fill зависит от книги
+            markout = (y - bid) * 100
+            markouts.append(markout)
+        avg_mk = sum(markouts) / len(markouts)
+        med_mk = sorted(markouts)[len(markouts) // 2]
+        pos_days = sum(1 for m in markouts if m > 0)
+        print(f"    {label:10s}: avg_markout={avg_mk:+.2f}¢  median={med_mk:+.2f}¢  "
+              f"fills={len(markouts)}  дни+={pos_days}/{len(markouts)}")
+
+    # Тот же расчёт, но с venue-ценой (priceToBeat/finalPrice)
+    # ptb = цена, которую мы «платим» (наш entry), fp = цена резолва
+    print(f"\n  Markout по venue-ценам (ptb/fp):")
+    for label, centers, hw_list in [("Gaussian", gauss_centers, gauss_hw),
+                                     ("Learned", model_centers, model_hw)]:
+        markouts_venue = []
+        for i in range(len(test_feats)):
+            # Ищем venue info
+            # (test_feats и windows синхронизированы)
+            # Пока пропускаем — нужен доступ к windows_by_key
+            pass
+        # Используем простую модель: center как entry, y как outcome
+        for i in range(len(test_feats)):
+            y = test_y[i]
+            center = centers[i]
+            hw = hw_list[i]
+            # MM-quote: bid = center − hw, ask = center + hw
+            # Если мы покупаем (bid fill): entry = bid, outcome = y
+            # markout = (y − bid) · 100
+            bid = max(0.005, center - hw)
+            ask = min(0.995, center + hw)
+            # Двусторонний: fill BUY по bid, fill SELL по ask
+            # BUY markout = (y − bid)·100
+            # SELL markout = (ask − y)·100 = (1 − y − (1 − ask))·100
+            buy_mk = (y - bid) * 100
+            sell_mk = (ask - (1 - y)) * 100  # NO-нога: (ask − (1−y))·100
+            # Пара: BUY + SELL = (y − bid) + (ask − (1−y)) = (2y − 1) + (ask − bid)
+            pair_mk = buy_mk + sell_mk
+            markouts_venue.append({"buy": buy_mk, "sell": sell_mk, "pair": pair_mk})
+        avg_buy = sum(m["buy"] for m in markouts_venue) / len(markouts_venue)
+        avg_sell = sum(m["sell"] for m in markouts_venue) / len(markouts_venue)
+        avg_pair = sum(m["pair"] for m in markouts_venue) / len(markouts_venue)
+        print(f"    {label:10s}: BUY={avg_buy:+.2f}¢  SELL={avg_sell:+.2f}¢  PAIR={avg_pair:+.2f}¢")
+
     print(f"\nГотово. Результаты в {a.outdir}/")
 
 
