@@ -286,6 +286,8 @@ def main():
     ap.add_argument("--test-days", default="20260914,20260917,20260918")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--outdir", default="/tmp/traj")
+    ap.add_argument("--export-centers", default="",
+                    help="Экспортировать learned centers в JSON для clobmm.py")
     a = ap.parse_args()
 
     if a.selftest:
@@ -377,7 +379,8 @@ def main():
     X_tr = [[f[fn] for fn in feat_names] for f in train_feats]
     X_te = [[f[fn] for fn in feat_names] for f in test_feats]
 
-    w, b, mu, sd = train_logistic(X_tr, train_y, lr=0.01, epochs=500, l2=0.001)
+    w_model, b_model, mu_model, sd_model = train_logistic(X_tr, train_y, lr=0.01, epochs=500, l2=0.001)
+    w, b, mu, sd = w_model, b_model, mu_model, sd_model
     pred_tr = predict_logistic(X_tr, w, b, mu, sd)
     pred_te = predict_logistic(X_te, w, b, mu, sd)
 
@@ -388,6 +391,32 @@ def main():
 
     print(f"  Train: Brier={bs_tr:.4f}  accuracy={acc_tr:.1%}")
     print(f"  Test:  Brier={bs_te:.4f}  accuracy={acc_te:.1%}")
+
+    # Export centers if requested
+    if a.export_centers:
+        all_feats = train_feats + test_feats
+        all_preds = pred_tr + pred_te
+        centers = {}
+        for i, feat in enumerate(all_feats):
+            # Ключ = asset|start (как в windows_*.csv)
+            # Нужен asset и start — берём из feat или пересчитываем
+            pass
+        # Проще: пересчитать из windows
+        all_centers = {}
+        for w in windows:
+            venue_key = (w["asset"], w["start"])
+            venue_info = venue.get(venue_key)
+            venue_y = venue_info["y"] if venue_info else None
+            f = build_pricing_features(minutes, w, venue_y=venue_y)
+            if f is None:
+                continue
+            X = [[f[fn] for fn in feat_names]]
+            p = predict_logistic(X, w_model, b_model, mu_model, sd_model)[0]
+            key = f"{w['asset']}|{w['start']}"
+            all_centers[key] = round(p, 6)
+        with open(a.export_centers, "w") as f:
+            json.dump(all_centers, f)
+        print(f"  Centers exported: {len(all_centers)} → {a.export_centers}")
 
     # Сравнение с Gaussian
     brier_improvement = bs_gauss_te - bs_te

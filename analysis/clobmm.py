@@ -172,7 +172,8 @@ def qmed(v, p=0.5):
     return round(v[int(p * (len(v) - 1))], 2) if v else 0.0
 
 
-def sim(rows, per, sig, anchor, k, f, venue=None, inv_usd=0.0, max_part=0.0):
+def sim(rows, per, sig, anchor, k, f, venue=None, inv_usd=0.0, max_part=0.0,
+        centers=None):
     """Один рынок = одна независимая мини-книга (так устроено разрешение updown).
 
     Единицы (тут мы уже обжигались, поэтому словами): g = ¢/акц; lots = inv_usd/
@@ -234,10 +235,17 @@ def sim(rows, per, sig, anchor, k, f, venue=None, inv_usd=0.0, max_part=0.0):
             tau = float(max(10, c))
             s5 = sig.get(asset, t1 - 60)
             x = d_bps / (s5 * math.sqrt(tau / 300.0))
-            pa = min(max(phi(x), 0.01), 0.99)
+            # Learned center override
+            if centers and (asset, start) in centers:
+                pa = centers[(asset, start)]
+                sigma_p = math.sqrt(max(0.01, pa * (1.0 - pa)))
+                step = float(max(15, min(c - c2, int(tau))))
+                h = max(0.005, k * sigma_p * math.sqrt(step / tau))
+            else:
+                pa = min(max(phi(x), 0.01), 0.99)
+                step = float(max(15, min(c - c2, int(tau))))
+                h = max(0.005, k * pdf(x) * math.sqrt(step / tau))
             center = pa if anchor else mids.get(c, pa)
-            step = float(max(15, min(c - c2, int(tau))))
-            h = max(0.005, k * pdf(x) * math.sqrt(step / tau))
             bid = min(max(center - h, 0.005), 0.99)
             ask = min(max(bid + 0.01, center + h), 0.995)
             eb = bid - mid2 if (pos <= 0 and mid2 <= bid - f) else -1.0
@@ -308,6 +316,9 @@ def main():
     ap.add_argument("--max-part", type=float, default=0.0,
                     help="не выставлять, если заявка > этой доли оборота окна "
                          "(0.05 = 5%%; 0 = фильтр выключен)")
+    ap.add_argument("--centers-file", default="",
+                    help="JSON {(asset,start): center} — замена Gaussian Φ "
+                         "(из price_model.py --export-centers)")
     a = ap.parse_args()
     assets = set(x.strip() for x in a.assets.split(","))
     codes = set(x.strip() for x in a.codes.split(","))
@@ -326,7 +337,15 @@ def main():
               f"ярлыке P&L и все четыре гейта НЕ сравнимы с прогоном по клиновому "
               f"прокси — это другой стандарт, и он честнее (см. загрузчик)")
     iv_kw = dict(venue=venue, inv_usd=a.inventory_usd, max_part=a.max_part)
-    on = sim(rows, per, sig, True, a.k, f0, **iv_kw)
+    # Загрузка learned centers (если есть)
+    centers = None
+    if a.centers_file and os.path.exists(a.centers_file):
+        with open(a.centers_file) as f:
+            raw = json.load(f)
+        centers = {(k.split("|")[0], int(k.split("|")[1])): v
+                   for k, v in raw.items()}
+        print(f"  learned centers: {len(centers)} окон из {a.centers_file}")
+    on = sim(rows, per, sig, True, a.k, f0, centers=centers, **iv_kw)
     neu = sim(rows, per, sig, False, a.k, f0, **iv_kw)
     print()
     print(fmt("primary (anchor on)", on))
@@ -343,7 +362,7 @@ def main():
     grid = {}
     for kk in ks:
         for ff in fs:
-            r = sim(rows, per, sig, True, kk, ff, **iv_kw)
+            r = sim(rows, per, sig, True, kk, ff, centers=centers, **iv_kw)
             grid[(kk, ff)] = r["pnl"]
             print(f"  k={kk:>4} f={100*ff:>5.1f}¢: P&L {r['pnl']:>12.1f}$  "
                   f"days+ {r['days_pos']:>2}/{r['days_n']:<2}  markout {r['mark_s_med']:>6.2f}¢")
