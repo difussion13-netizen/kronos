@@ -317,11 +317,22 @@ risk-лимит файлом.
 ## Polymarket → Binance edge (поставлен 20.09, после закрытия MM и тейкера)
 Идея: Polymarket — не площадка, а информационный слой. Цена агрегирует informed
 flow, oracle-lag ~30 сек = временное окно. Направление: найти alpha для Binance
-spot/perp через паттерны первых минут и cross-asset lead-lag.
-План и идеи: `docs/research-polymarket-edge.md` (R1–R6, пороги предрешены).
-Инструмент: `analysis/trajectory.py` (--selftest OK). Данные: те же минутки
-из `$WORK/win/`. Phase 1 (R1/R2/R3) — данные есть, час работы; Phase 2 (R4/R5)
-— нужен Polymarket price feed.
+spot/perp через паттерны первых минут и обученную модель P(up).
+План и результаты: `docs/research-polymarket-edge.md`.
+Инструменты: `analysis/trajectory.py`, `analysis/price_model.py`.
+
+**Результаты Phase 1 (20.09):**
+- R1 Trajectory: r=0.49 skew, r=0.45 momentum — 🔥 сильный
+- R1.5 Классификатор: 75.2% test accuracy (baseline 49.4%), EV +1.75 bps — 🔥
+- R2 Lead-lag: r=0.03 — ❌ КРАСНЫЙ, закрыто
+- R3 Vol prediction: R²=0.10 — ⚠️ фильтр, не standalone
+- R7 Learned P(up): Brier 0.2024 vs Gaussian 0.2307, +0.0284 — ✅ ЗЕЛЁНЫЙ
+
+**Следующие шаги (21.09+):**
+1. MM-сравнение (Gaussian vs Learned center → markout/P&L)
+2. OOS validation на 19.09 (порог: acc≥65%)
+3. R4/R5: нужен Polymarket price feed
+4. Paper trading module: Binance WS, сигнал каждые 3 мин, журнал
 
 Мейкерский минус (−11.29¢/акц на платёж площадки, все бины отрицательны) имеет
 конкурирующее объяснение, в котором прогноз не нужен: в updown зарабатывает

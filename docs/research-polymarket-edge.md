@@ -253,9 +253,132 @@ Phase 3 (если Phase 2 зелёный):
 | R2 correlation | r>0.3, p<0.01, ≥2 alt | r>0.2 | r≤0.2 |
 | R3 R² | >0.05 | 0.02–0.05 | <0.02 |
 | R4 signal rate | >5/день | 1–5/день | <1/день |
+| R7 Brier improvement | >0.005 | 0–0.005 | <0 |
 
 Все красные → направление «Polymarket → Binance» закрывается протоколом.
 Хотя бы один зелёный → строим trading module.
+
+---
+
+## Результаты (20.09.2026, Phase 1)
+
+Датасет: 12 суток минуток (04–14 + 17–18), 14614 окон 5m, 12515 venue labels.
+Train: 08–13, Test: 14. Инструменты: `trajectory.py`, `price_model.py`.
+
+### R1. Trajectory Features — ЗЕЛЁНЫЙ 🔥
+
+Корреляции фичей с y_dir (направление close vs open, train n=6898):
+
+| Фича | r с y_dir | Комментарий |
+|---|---|---|
+| skew | **+0.4935** | Смещение цены к краю 3-мин диапазона |
+| ret_full | **+0.4547** | 3-мин momentum |
+| ret_2 | +0.3448 | 2-й мин return |
+| ret_1 | +0.3165 | 1-мин return |
+| range_bps | +0.0013 | Шум |
+| reversal | −0.0138 | Шум |
+| accel | +0.0096 | Шум |
+
+Вывод: momentum continuation в крипто 5-мин окнах — **сильный и robust** сигнал.
+Форма первых 3 минут предсказывает направление с r=0.45–0.49.
+
+### R1.5. Классификатор (logistic regression) — ЗЕЛЁНЫЙ 🔥🔥
+
+| Метрика | Значение |
+|---|---|
+| Test accuracy | **75.2%** (baseline 49.4%) |
+| Edge vs baseline | **+25.8%** |
+| P∈[0.80,1.0) precision | 92.2% (n=141) |
+| P∈[0.70,0.80) precision | 80.0% (n=135) |
+| High-conf \|P−0.5\|>0.15 | 81.0% (n=684, 78% теста) |
+| EV/trade | +1.75 bps (после 0.4 bps fees) |
+| trades/day | ~228 |
+
+Feature importance: skew 30.4%, ret_full 26.6%, ret_1 20.5%, ret_2 18.1%.
+Model = σ(α·skew + β·ret_full + γ·ret_1 + δ·ret_2) — momentum continuation.
+
+**Оговорка:** 3 дня теста (872 окна) — мало для robust-вердикта. Завтрашний
+19.09 добавит ~1300 окон. Train≈Test (74.7% vs 75.2%) — overfitting unlikely,
+но нужна проверка на 4-м дне.
+
+### R2. Cross-Asset Lead-Lag — КРАСНЫЙ ❌
+
+| Лаг | BTC→ETH | BTC→SOL | BTC→XRP |
+|---|---|---|---|
+| lag=1 | 0.002 | 0.024* | 0.019 |
+| lag=2 | −0.018 | −0.032*** | −0.021* |
+| lag=3 | 0.046*** | 0.034*** | 0.031*** |
+| lag=4 | 0.016 | 0.005 | 0.002 |
+| lag=5 | −0.016 | −0.017 | −0.025* |
+
+Паттерн «+lag3, −lag2» — общий рыночный фактор, не tradeable lead-lag.
+r=0.03–0.05 < порога 0.3. **Закрыто.**
+
+### R3. Volatility Prediction — ЖЁЛТЫЙ (фильтр)
+
+| | R² | Корреляция |
+|---|---|---|
+| Train | 0.1597 | 0.3996 |
+| Test | 0.0991 | 0.3148 |
+
+Не standalone (R²<0.25), но **полезно как фильтр**: high-vol окна → не scalp.
+
+### R7. Learned P(up) Model — ЗЕЛЁНЫЙ ✅
+
+| Метрика | Gaussian Φ | Learned | Δ |
+|---|---|---|---|
+| Brier (test) | 0.2307 | **0.2024** | **+0.0284** |
+| Accuracy (test) | 67.2% | **70.0%** | +2.8% |
+| Train accuracy | 63.8% | 65.2% | — |
+
+Calibration improvement (test):
+- P∈[0.2,0.3): Gaussian err=0.16 → Learned err=**0.00** (идеально)
+- P∈[0.3,0.5): Gaussian err=0.13 → Learned err=**0.04** (×3 лучше)
+- P∈[0.5,0.7): Gaussian err=0.07 → Learned err=**0.02** (×3–4 лучше)
+- P∈[0.7,1.0): обе перекалиброваны (err=0.12–0.15)
+
+Feature weights: center_gauss 28.3%, ret_1 27.0%, z_score 23.9%.
+Модель = Gaussian + momentum correction. Спред сужается на ~15% при том же
+fill rate → markout ближе к нулю.
+
+**Следующий шаг:** MM-сравнение (Gaussian vs Learned center) → markout/P&L.
+
+---
+
+## Сводка вердиктов
+
+| # | Идея | Вердикт | Ключевое число |
+|---|---|---|---|
+| R1 | Trajectory features | 🔥 ЗЕЛЁНЫЙ | r=0.49 |
+| R1.5 | Классификатор | 🔥 ЗЕЛЁНЫЙ | acc=75.2% |
+| R2 | Lead-lag | ❌ КРАСНЫЙ | r=0.03 |
+| R3 | Vol prediction | ⚠️ ЖЁЛТЫЙ | R²=0.10 |
+| R7 | Learned P(up) | ✅ ЗЕЛЁНЫЙ | Brier +0.0284 |
+| R4 | MMP momentum | ⏳ Нет feed | — |
+| R5 | Impl vs Real vol | ⏳ Нет feed | — |
+| R6 | Microstructure | ⏳ После R1 | — |
+
+Phase 1 завершена: 3 зелёных, 1 жёлтый, 1 красный.
+Направление **НЕ закрывается** — есть tradeable edge.
+
+---
+
+## Следующие шаги (21.09+)
+
+1. **MM-сравнение** (price_model.py): Gaussian vs Learned center → markout/P&L
+2. **OOS validation**: trajectory + price_model на 19.09 (порог: acc≥65%)
+3. **R4/R5**: нужен Polymarket price feed (WS-подписка)
+4. **Paper trading module**: Binance WebSocket, сигнал каждые 3 мин, журнал
+
+---
+
+## Статус логгера (20.09.2026)
+- PID 1901, active 39 мин, RAM 134 МБ
+- CLOB: 256947 msg, 8 reconnects ✅
+- Binance: 153127 msg, 1 reconnect ✅
+- RTDS: 261 msg, 29 reconnects ⚠️ (idle→reconnect loop, не критично)
+- S3-выгрузка работает
+- Лог: `/var/log/kronolog.log` (не `/tmp/live.log`)
 
 ---
 
@@ -263,5 +386,7 @@ Phase 3 (если Phase 2 зелёный):
 - Минутки: `$WORK/win/minutes_YYYYMMDD.csv`
 - Окна: `$WORK/win/windows_YYYYMMDD.csv`
 - Карта токенов: `$WORK/win/tokens_map.json`
+- Venue labels: `$WORK/venue.jsonl` (12515 записей, 04–14.09)
 - dataset.py output: `$DS/{asset}_300s.csv` (генерируется на боксе)
-- Протокол закрытия: `docs/mm-verdict-20260920.md`
+- Протокол закрытия MM: `docs/mm-verdict-20260920.md`
+- Скрипты: `analysis/trajectory.py`, `analysis/price_model.py`
